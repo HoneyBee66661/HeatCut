@@ -1,4 +1,4 @@
-# 🎬 CHEAT CLIP
+# 🎬 HEATCUT
 
 > **AI-Powered YouTube Viral Hotspot Finder** — Discover the most re-watched, high-energy moments in any YouTube video and turn them into viral Shorts, Reels, and TikToks in seconds.
 
@@ -16,9 +16,9 @@
   - [Prerequisites (Install These Free Tools)](#prerequisites-install-these-free-tools)
   - [Option A: One-Click Automatic Setup (Recommended)](#option-a-one-click-automatic-setup-recommended)
   - [Option B: Manual Step-by-Step Setup](#option-b-manual-step-by-step-setup)
-- [🔄 How to Update Cheat Clip (1-Click Update)](#-how-to-update-cheat-clip-1-click-update)
+- [🔄 How to Update HeatCut (1-Click Update)](#-how-to-update-cheat-clip-1-click-update)
 - [🔑 How to Get a Free Google Gemini API Key](#-how-to-get-a-free-google-gemini-api-key)
-- [🎯 How to Use Cheat Clip](#-how-to-use-cheat-clip)
+- [🎯 How to Use HeatCut](#-how-to-use-cheat-clip)
   - [Using the "Copy Timestamp" Features](#using-the-copy-timestamp-features)
   - [Searching Your Clip History](#searching-your-clip-history)
   - [Testing with Mock Mode (No Key Needed)](#testing-with-mock-mode-no-key-needed)
@@ -48,15 +48,15 @@
 
 ## ⚡ Quick Start for Non-Programmers (Super Easy!)
 
-You don't need any programming experience to run Cheat Clip on your computer. Just follow these steps:
+You don't need any programming experience to run HeatCut on your computer. Just follow these steps:
 
 ### Prerequisites (Install These Free Tools)
 
-Before running Cheat Clip for the first time, make sure your computer has these free tools:
+Before running HeatCut for the first time, make sure your computer has these free tools:
 
 | Software | Where to Download | Why & What to Do |
 |---|---|---|
-| **1. Git** *(Highly Recommended)* | 👉 [Download Git](https://git-scm.com/downloads) | **Makes future setup & updates 1-click simple!** Run the installer and click **Next** on all prompts with default settings. With Git installed, you can update Cheat Clip anytime just by double-clicking `update.bat` without ever re-downloading ZIP files. |
+| **1. Git** *(Highly Recommended)* | 👉 [Download Git](https://git-scm.com/downloads) | **Makes future setup & updates 1-click simple!** Run the installer and click **Next** on all prompts with default settings. With Git installed, you can update HeatCut anytime just by double-clicking `update.bat` without ever re-downloading ZIP files. |
 | **2. Node.js** | 👉 [Download Node.js (LTS)](https://nodejs.org/) | Download the **LTS (Recommended for Most Users)** installer, open it, and click **Next** until finished. |
 | **3. Python** | 👉 [Download Python](https://www.python.org/downloads/) | **CRITICAL FOR WINDOWS:** When the Python installer opens, check the box at the bottom that says **`☑ Add python.exe to PATH`** before clicking "Install Now"! |
 
@@ -70,8 +70,8 @@ Before running Cheat Clip for the first time, make sure your computer has these 
 - **With Git (Recommended):**
   Open your command prompt or terminal and run:
   ```bash
-  git clone https://github.com/your-username/cheat-clip.git
-  cd cheat-clip
+  git clone https://github.com/your-username/heatcut.git
+  cd heatcut
   ```
 - **Without Git:**
   Click the green **"Code"** button at the top of the GitHub page, choose **"Download ZIP"**, and extract the ZIP file to any folder on your computer.
@@ -89,7 +89,7 @@ We've included automatic setup scripts so you don't have to type terminal comman
    - When it says *"Setup Complete!"*, press any key to close the window.
 3. Double-click **`start.bat`**.
    - Your web browser will automatically open at **`http://localhost:5173`**!
-   - Keep the black launcher window open while using Cheat Clip. When you are done, close the window or press `Ctrl + C`.
+   - Keep the black launcher window open while using HeatCut. When you are done, close the window or press `Ctrl + C`.
 
 #### On macOS & Linux:
 1. Open the **Terminal** app.
@@ -130,7 +130,7 @@ If you prefer using the command prompt/terminal directly:
 
 ---
 
-## 🔄 How to Update Cheat Clip (1-Click Update)
+## 🔄 How to Update HeatCut (1-Click Update)
 
 Whenever new features, bug fixes, or new Gemini AI models are released, you can easily update your installation if you have Git installed:
 
@@ -155,19 +155,19 @@ Whenever new features, bug fixes, or new Gemini AI models are released, you can 
 
 ## 🔑 How to Get a Free Google Gemini API Key
 
-Cheat Clip uses Google's AI to find viral moments. Getting a key is **100% free** and requires **no credit card**:
+HeatCut uses Google's AI to find viral moments. Getting a key is **100% free** and requires **no credit card**:
 
 1. Go to **[Google AI Studio](https://aistudio.google.com/)**.
 2. Sign in with any Google account.
 3. Click the blue **"Get API key"** button (or click **"Create API key"**).
 4. Select a project (or click *"Create API key in new project"*).
 5. Copy the generated key (it starts with `AIzaSy...`).
-6. Paste it into the **Gemini API Key** field in the Cheat Clip app.
+6. Paste it into the **Gemini API Key** field in the HeatCut app.
    - The app will securely save your key in your browser's local storage so you won't have to enter it again!
 
 ---
 
-## 🎯 How to Use Cheat Clip
+## 🎯 How to Use HeatCut
 
 1. **Paste a YouTube URL** into the main input box (e.g. `https://www.youtube.com/watch?v=dQw4w9WgXcQ`).
 2. **Enter your Gemini API Key** (or enter `mock` to try test data).
@@ -183,7 +183,7 @@ Cheat Clip uses Google's AI to find viral moments. Getting a key is **100% free*
 
 ### Using the "Copy Timestamp" Features
 
-Cheat Clip makes copying timestamps fast for video editors and YouTube creators:
+HeatCut makes copying timestamps fast for video editors and YouTube creators:
 
 - **Copy a Single Timestamp**:
   - Click the **`⏱️ 01:23 - 01:53`** badge on any clip card, or click the **`⏱️ Copy Timestamp`** button at the bottom of the card.
@@ -198,7 +198,7 @@ Cheat Clip makes copying timestamps fast for video editors and YouTube creators:
 
 ### Searching Your Clip History
 
-Cheat Clip keeps a highlighted **Previously Analyzed Clips** panel on your dashboard:
+HeatCut keeps a highlighted **Previously Analyzed Clips** panel on your dashboard:
 - Type in the search box to filter past videos by **video title**, **YouTube link**, **clip title**, or **spoken quote**.
 - Click **"📂 Load Results"** on any past video to instantly view the heatmap and clips again without using any API quota!
 - Accidental deletion protection: The **"🗑 Clear All"** button includes a confirmation prompt to keep your history safe.
@@ -235,7 +235,7 @@ Want to see how the app looks before getting an API key?
 ---
 
 ### ❓ "Port 8000 or 5173 is already in use"
-- **Why this happens:** An earlier instance of Cheat Clip or another server is still running in the background.
+- **Why this happens:** An earlier instance of HeatCut or another server is still running in the background.
 - **Solution:**
   - On Windows: Press `Ctrl + Shift + Esc` (Task Manager), look for `node.exe` or `python.exe`, and click "End Task".
   - Or restart your computer.
@@ -246,14 +246,14 @@ Want to see how the app looks before getting an API key?
 - **Why this happens:** The YouTube video has disabled captions or has no spoken dialogue.
 - **Solution:**
   - Select the **"Manual Upload (SRT / Text)"** option right below the URL bar.
-  - Paste any transcript text or upload an `.srt` file, and Cheat Clip will analyze it seamlessly!
+  - Paste any transcript text or upload an `.srt` file, and HeatCut will analyze it seamlessly!
 
 ---
 
 ### ❓ "Quota limit reached / Error 429"
 - **Why this happens:** Google's free Gemini tier has minute/day rate limits.
 - **Solution:**
-  - Cheat Clip **automatically tries all available Flash models** (3.7, 3.5, 2.5, 2.0, 1.5) before giving up!
+  - HeatCut **automatically tries all available Flash models** (3.7, 3.5, 2.5, 2.0, 1.5) before giving up!
   - If all free models are temporarily busy, wait 1-2 minutes and try again.
   - You can also click the red **"🔑 Change API Key"** button to generate a new free key from a different Google account.
 

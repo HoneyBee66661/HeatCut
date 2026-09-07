@@ -21,7 +21,7 @@ export const en = {
     aiModelLabel: "AI Model Selection",
     fetchingModels: "Fetching available...",
     resilienceTip: "Free Tier Resilience:",
-    resilienceDesc: "If a model encounters quota limits or errors, Cheat Clip automatically tries all newer and older Flash models (3.x, 2.5, 2.0, 1.5) fetched from your API key until clips are successfully found!",
+    resilienceDesc: "If a model encounters quota limits or errors, HeatCut automatically tries all newer and older Flash models (3.x, 2.5, 2.0, 1.5) fetched from your API key until clips are successfully found!",
     
     // Customization
     clipCustomizationTitle: "Clip Customization",

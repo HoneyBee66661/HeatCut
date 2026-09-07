@@ -38,7 +38,7 @@ from google.genai import types
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cheat-clip")
 
-app = FastAPI(title="CHEAT CLIP API", description="AI-powered YouTube Viral Hotspot Finder")
+app = FastAPI(title="HEATCUT API", description="AI-powered YouTube Viral Hotspot Finder")
 
 # Configure CORS — origins come from ALLOWED_ORIGINS (comma-separated env var).
 # Default (unset): local Vite dev servers only. In production the frontend and
@@ -927,7 +927,7 @@ def health_check():
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     return {
         "status": "ok",
-        "message": "CHEAT CLIP API is active",
+        "message": "HEATCUT API is active",
         "is_vercel": is_vercel,
         "supadata_keys_count": len(keys),
         "proxy_configured": bool(proxy),
@@ -1336,9 +1336,9 @@ async def analyze_video(request: AnalyzeRequest):
                 ViralClip(title="Introductory overview of the tool", start_time=0.0,  end_time=11.0, hook_time=3.0, virality_score=72,
                           key_quotes=["Hello and welcome.", "Finds viral hotspots."],
                           transcript="Hello and welcome. It finds viral hotspots and highlights them.",
-                          title_suggestion="Meet Cheat Clip AI",
+                          title_suggestion="Meet HeatCut AI",
                           caption_suggestion="Say hello to your new AI co-editor. Find the absolute best parts of any video instantly.",
-                          hashtag_suggestion="#cheatclip #aiediting #growthmindset"),
+                          hashtag_suggestion="#heatcut #aiediting #growthmindset"),
             ]
             mock_heatmap = [
                 HeatmapPoint(start_time=i*10.0, end_time=(i+1)*10.0,
@@ -1362,7 +1362,7 @@ async def analyze_video(request: AnalyzeRequest):
             result = AnalyzeResponse(
                 video_id=video_id, title=title, duration=duration or 200.0,
                 heatmap=mock_heatmap,
-                summary="Mock analysis: this video explains how CHEAT CLIP works. #aitools #videoediting #productivity",
+                summary="Mock analysis: this video explains how HEATCUT works. #aitools #videoediting #productivity",
                 clips=mock_clips,
                 model="Mock Gemini"
             )

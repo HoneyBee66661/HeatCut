@@ -1327,7 +1327,7 @@ Transcript:
         <div className="header-logo">
           <span style={{ fontSize: '2.5rem' }}>⚡</span>
           <div>
-            <h1 className="text-gradient logo-title">CHEAT CLIP</h1>
+            <h1 className="text-gradient logo-title">HEATCUT</h1>
             <p className="header-subtitle">{t.header.subtitle}</p>
           </div>
         </div>
