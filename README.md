@@ -390,6 +390,27 @@ visitor's browser (localStorage) — the backend never holds a Gemini key.
 
 ---
 
+## 📡 Heatmap via your device (loopback worker)
+
+Cloud deploys (Vercel) can't scrape YouTube retention heatmaps — YouTube blocks
+datacenter IPs and Supadata has no heatmap endpoint. Optional **loopback worker**
+fixes that using the device you actually browse from (residential connection):
+
+1. Terminal 1, on the same device you open the app from (phone/PC):
+   ```bash
+   .venv/bin/python backend/heatmap_worker.py    # listens on 127.0.0.1:8765
+   ```
+   (needs `fastapi`, `uvicorn`, `yt-dlp` — already in `backend/requirements.txt`)
+2. Open the app **from that device**. The page probes the worker (~400ms,
+   silent), and when found attaches real yt-dlp metadata + retention heatmap —
+   fetched over your residential IP — to every analysis sent to the cloud
+   backend. A toast confirms: "📡 Heatmap via device".
+
+Worker offline = graceful fallback (Supadata transcripts, no heatmap). Optional
+proxy: `PROXY_URL` / `WEBSHARE_PROXY`. Port override: `HEATMAP_WORKER_PORT`.
+
+---
+
 ## 📄 License
 
 Distributed under the **MIT License**. See `LICENSE` for more information.

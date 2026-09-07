@@ -159,6 +159,7 @@ export const id: Translations = {
     signalRetention: "🔥 Retention",
     signalText: "✨ Teks",
     signalBoth: "💎 Retention + Teks",
+    deviceHeatmapFound: "📡 Heatmap lewat device (loopback worker)",
     hookClickHint: "Klik untuk melompat ke timestamp potensi hook",
     copyAllTimestampsSelectFormat: "Pilih Format",
     copyFormatOnlyTimestamps: "⏱️ Hanya Timestamp",

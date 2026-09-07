@@ -44,6 +44,8 @@ declare global {
   }
 }
 
+const HEATMAP_WORKER_URL = 'http://127.0.0.1:8765';
+
 export default function App() {
   const { t } = useLanguage();
   const [url, setUrl] = useState('');
@@ -776,6 +778,31 @@ export default function App() {
     let resultData: AnalyzeResponse | null = null;
 
     try {
+      // Loopback heatmap worker: if backend/heatmap_worker.py runs on this same
+      // device, grab real yt-dlp metadata + retention heatmap over the user's
+      // residential connection and attach it to the request. Cloud fallback
+      // otherwise. Fully silent when the worker is offline (~400ms probe).
+      const vid = extractVideoId(url.trim());
+      let deviceMeta: { client_heatmap: { start_time: number; end_time: number; value: number }[]; client_title: string; client_duration: number } | null = null;
+      if (vid) {
+        try {
+          const hc = await fetch(`${HEATMAP_WORKER_URL}/health`, { signal: AbortSignal.timeout(400) });
+          if (hc.ok) {
+            const hm = await fetch(`${HEATMAP_WORKER_URL}/heatmap?video_id=${encodeURIComponent(vid)}`, { signal: AbortSignal.timeout(15000) });
+            if (hm.ok) {
+              const j = await hm.json();
+              if (Array.isArray(j.heatmap) && j.heatmap.length > 0) {
+                deviceMeta = { client_heatmap: j.heatmap, client_title: j.title, client_duration: j.duration };
+                setToastMessage(t.results.deviceHeatmapFound);
+                setTimeout(() => setToastMessage(null), 3500);
+              }
+            }
+          }
+        } catch {
+          // worker offline — proceed with normal server-side flow
+        }
+      }
+
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -790,6 +817,9 @@ export default function App() {
           subtitles: subtitlesSource === 'manual' ? manualSubtitlesContent : undefined,
           subtitles_filename: subtitlesSource === 'manual' ? manualSubtitlesFileName : undefined,
           target_clip_count: targetClipCount,
+          client_heatmap: deviceMeta?.client_heatmap,
+          client_title: deviceMeta?.client_title,
+          client_duration: deviceMeta?.client_duration,
         }),
       });
 

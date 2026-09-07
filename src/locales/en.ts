@@ -157,6 +157,7 @@ export const en = {
     signalRetention: "🔥 Retention",
     signalText: "✨ Text",
     signalBoth: "💎 Retention + Text",
+    deviceHeatmapFound: "📡 Heatmap via device (loopback worker)",
     hookClickHint: "Click to jump to the potential hook timestamp",
     copyAllTimestampsSelectFormat: "Choose Format",
     copyFormatOnlyTimestamps: "⏱️ Only Timestamps",

@@ -116,6 +116,9 @@ class AnalyzeRequest(BaseModel):
     subtitles: Optional[str] = Field(None, description="Optional manual subtitles text (SRT or TXT)")
     subtitles_filename: Optional[str] = Field(None, description="Optional manual subtitles filename")
     target_clip_count: Optional[int] = Field(None, description="Optional target number of clips (1-50)")
+    client_heatmap: Optional[List[dict]] = Field(default=None, description="Client-asserted retention heatmap from the device loopback worker (list of {start_time, end_time, value})")
+    client_title: Optional[str] = Field(default=None, description="Client-asserted video title from the device loopback worker")
+    client_duration: Optional[float] = Field(default=None, description="Client-asserted video duration in seconds from the device loopback worker")
 
 class HeatmapPoint(BaseModel):
     start_time: float
@@ -1088,7 +1091,20 @@ async def analyze_video(request: AnalyzeRequest):
         })
 
         try:
-            metadata = await asyncio.to_thread(fetch_video_metadata, request.url)
+            if request.client_heatmap is not None:
+                # Client-asserted metadata from the device loopback heatmap worker:
+                # real yt-dlp data fetched over the user's residential connection
+                # (see README "Heatmap via your device (loopback worker)").
+                metadata = {
+                    "title": (request.client_title or "").strip() or "YouTube Video",
+                    "duration": float(request.client_duration or 0.0),
+                    "heatmap": request.client_heatmap,
+                    "is_live": False,
+                    "live_status": "not_live",
+                }
+                logger.info(f"Client-supplied metadata/heatmap accepted ({len(request.client_heatmap)} heatmap points).")
+            else:
+                metadata = await asyncio.to_thread(fetch_video_metadata, request.url)
             title    = metadata["title"]
             duration = metadata["duration"]
             heatmap  = metadata.get("heatmap") or []
