@@ -46,6 +46,12 @@ declare global {
 
 const HEATMAP_WORKER_URL = 'http://127.0.0.1:8765';
 
+const MODEL_PRESETS: Record<string, string[]> = {
+  openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini'],
+  anthropic: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-opus-4-1'],
+  'openai-compatible': ['deepseek-chat', 'deepseek-reasoner', 'gpt-4o-mini'],
+};
+
 export default function App() {
   const { t } = useLanguage();
   const [url, setUrl] = useState('');
@@ -170,6 +176,10 @@ export default function App() {
   // Assistance feature: Checklist for marked clips
   const [markedClips, setMarkedClips] = useState<Record<string, boolean>>({});
   const [exportingClipKey, setExportingClipKey] = useState<string | null>(null);
+  const [serverGemini, setServerGemini] = useState(false);
+  const [aiProvider, setAiProvider] = useState('gemini');
+  const [aiBaseUrl, setAiBaseUrl] = useState('');
+  const [showAiSettings, setShowAiSettings] = useState(false);
   const [loadingDetails, setLoadingDetails] = useState('');
 
   // History feature: previously analyzed videos from localStorage
@@ -230,17 +240,40 @@ export default function App() {
     }
   }, [loading]);
 
-  // Fetch available AI models when API key is detected/entered
+  // Detect whether the server provides a Gemini key via env (GEMINI_API_KEY).
+  // When true, the per-user API key input is hidden — visitors just Analyze.
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/health')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (alive && d && d.gemini_env_configured === true) setServerGemini(true);
+      })
+      .catch(() => { /* keep default false */ });
+    return () => { alive = false; };
+  }, []);
+
+  // Fetch available AI models when API key is detected/entered (or server key)
   useEffect(() => {
     const fetchModels = async () => {
       const cleanKey = apiKey.trim();
-      if (!cleanKey || cleanKey.length < 20 || cleanKey.toLowerCase() === 'mock') {
+      if (!serverGemini && (!cleanKey || cleanKey.length < 20 || cleanKey.toLowerCase() === 'mock')) {
         setAvailableModels([]);
+        return;
+      }
+      if (aiProvider !== 'gemini') {
+        const presets = MODEL_PRESETS[aiProvider] || MODEL_PRESETS.openai;
+        setAvailableModels(presets);
+        if (!presets.includes(selectedModel)) {
+          setSelectedModel(presets[0]);
+          localStorage.setItem('cheat_clip_selected_model', presets[0]);
+        }
         return;
       }
       setLoadingModels(true);
       try {
-        const res = await fetch(`/api/models?api_key=${encodeURIComponent(cleanKey)}`);
+        const qs = cleanKey ? `?api_key=${encodeURIComponent(cleanKey)}` : '';
+        const res = await fetch(`/api/models${qs}`);
         if (res.ok) {
           const data = await res.json();
           if (data.models && data.models.length > 0) {
@@ -264,7 +297,7 @@ export default function App() {
     }, 600);
 
     return () => clearTimeout(delayDebounce);
-  }, [apiKey]);
+  }, [apiKey, serverGemini, aiProvider]);
 
   // Sync marked clips with local storage based on active video ID
   useEffect(() => {
@@ -661,8 +694,8 @@ export default function App() {
     e.preventDefault();
     if (!url.trim()) return;
 
-    // Require an API key before making any request
-    if (!apiKey.trim()) {
+    // Require an API key before making any request (unless the server provides one)
+    if (!apiKey.trim() && !serverGemini) {
       setError(t.errors.apiKeyRequired);
       return;
     }
@@ -820,6 +853,8 @@ export default function App() {
           client_heatmap: deviceMeta?.client_heatmap,
           client_title: deviceMeta?.client_title,
           client_duration: deviceMeta?.client_duration,
+          provider: aiProvider,
+          base_url: aiProvider === 'openai-compatible' ? (aiBaseUrl.trim() || undefined) : undefined,
         }),
       });
 
@@ -1401,53 +1436,91 @@ Transcript:
                 🤖 {t.form.aiSettingsTitle}
               </h3>
               
-              {/* API Key input — required */}
+              {/* AI access — server-provided key, or advanced per-provider settings */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                <label style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                  <span>
-                    {t.form.apiKeyLabel}
-                    <span style={{ marginLeft: '0.4rem', fontSize: '0.7rem', fontWeight: 700, color: '#f87171', background: 'rgba(239,68,68,0.12)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '4px', padding: '0.1rem 0.35rem', letterSpacing: '0.04em' }}>{t.form.apiKeyRequired}</span>
-                  </span>
-                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                    <a
-                      href="https://aistudio.google.com/"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: '0.75rem', fontWeight: 600, transition: 'var(--transition-smooth)' }}
-                      className="action-link-btn"
-                    >
-                      🔑 {t.form.getFreeKey}
-                    </a>
-                    <span style={{ color: 'rgba(255,255,255,0.15)', fontSize: '0.75rem' }}>|</span>
-                    <span
-                      onClick={() => setShowApiKey(!showApiKey)}
-                      style={{ cursor: 'pointer', color: 'var(--primary)', fontSize: '0.75rem' }}
-                    >
-                      {showApiKey ? t.form.hideKey : t.form.showKey}
-                    </span>
+                {serverGemini ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', padding: '0.7rem 0.9rem', borderRadius: '10px', background: 'rgba(105,240,174,0.08)', border: '1px solid rgba(105,240,174,0.28)' }}>
+                    <span style={{ fontSize: '1rem' }}>✨</span>
+                    <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{t.form.serverKeyActive}</span>
                   </div>
-                </label>
-                <input
-                  id="gemini-key-input"
-                  type={showApiKey ? 'text' : 'password'}
-                  className={`form-input${!apiKey.trim() ? ' input-error-highlight' : ''}`}
-                  placeholder={t.form.apiKeyPlaceholder}
-                  value={apiKey}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setApiKey(val);
-                    localStorage.setItem('cheat_clip_gemini_api_key', val);
-                    if (val.trim()) setError(null);
-                  }}
-                  disabled={loading}
-                  style={{ height: '42px' }}
-                />
-                {!apiKey.trim() && (
-                  <span style={{ fontSize: '0.75rem', color: '#f87171', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
-                    {t.form.apiKeyErrorHint}
-                  </span>
+                ) : (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', padding: '0.7rem 0.9rem', borderRadius: '10px', background: 'rgba(255,213,79,0.08)', border: '1px solid rgba(255,213,79,0.25)' }}>
+                    <span style={{ fontSize: '1rem' }}>🔑</span>
+                    <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{t.form.addKeyHint}</span>
+                  </div>
                 )}
+
+                {/* Advanced AI settings drawer */}
+                <div style={{ border: '1px solid rgba(255,255,255,0.07)', borderRadius: '10px', overflow: 'hidden' }}>
+                  <button
+                    type="button"
+                    onClick={() => setShowAiSettings((v) => !v)}
+                    style={{ width: '100%', padding: '0.55rem 0.8rem', background: 'transparent', border: 'none', color: 'var(--primary)', fontSize: '0.8rem', fontWeight: 600, textAlign: 'left', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                  >
+                    <span>⚙️ {t.form.advancedSettings}</span>
+                    <span>{showAiSettings ? '▲' : '▼'}</span>
+                  </button>
+                  {showAiSettings && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem', padding: '0.7rem 0.8rem', borderTop: '1px solid rgba(255,255,255,0.07)' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                        <label style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t.form.providerLabel}</label>
+                        <select
+                          className="form-input"
+                          value={aiProvider}
+                          onChange={(e) => { const p = e.target.value; setAiProvider(p); if (p !== 'openai-compatible') setAiBaseUrl(''); }}
+                          style={{ padding: '0.45rem 0.6rem' }}
+                        >
+                          <option value="gemini">Google Gemini</option>
+                          <option value="openai">OpenAI</option>
+                          <option value="anthropic">Anthropic Claude</option>
+                          <option value="openai-compatible">OpenAI-compatible (DeepSeek, OpenRouter, Groq…)</option>
+                        </select>
+                      </div>
+                      {aiProvider === 'openai-compatible' && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                          <label style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t.form.baseUrlLabel}</label>
+                          <input
+                            className="form-input"
+                            type="text"
+                            value={aiBaseUrl}
+                            onChange={(e) => setAiBaseUrl(e.target.value)}
+                            placeholder="https://api.deepseek.com/v1"
+                            style={{ padding: '0.45rem 0.6rem' }}
+                          />
+                        </div>
+                      )}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                        <label style={{ fontSize: '0.72rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                          {t.form.apiKeyLabel}
+                          {aiProvider !== 'gemini' && <span style={{ marginLeft: '0.35rem', fontSize: '0.65rem', color: 'rgba(255,255,255,0.45)' }}>{t.form.providerKeyNote}</span>}
+                        </label>
+                        <input
+                          id="gemini-key-input"
+                          type={showApiKey ? 'text' : 'password'}
+                          className="form-input"
+                          placeholder={t.form.apiKeyPlaceholder}
+                          value={apiKey}
+                          onChange={(e) => { const val = e.target.value; setApiKey(val); localStorage.setItem('cheat_clip_gemini_api_key', val); if (val.trim()) setError(null); }}
+                          disabled={loading}
+                          style={{ padding: '0.45rem 0.6rem', height: '38px' }}
+                        />
+                        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+                          <span onClick={() => setShowApiKey(!showApiKey)} style={{ cursor: 'pointer', color: 'var(--primary)', fontSize: '0.72rem' }}>
+                            {showApiKey ? t.form.hideKey : t.form.showKey}
+                          </span>
+                          {aiProvider === 'gemini' && (
+                            <a href="https://aistudio.google.com/" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: '0.72rem', fontWeight: 600 }} className="action-link-btn">
+                              🔑 {t.form.getFreeKey}
+                            </a>
+                          )}
+                        </div>
+                        <span style={{ fontSize: '0.7rem', color: 'rgba(255,255,255,0.4)' }}>
+                          {serverGemini ? t.form.overrideHint : t.form.mockHint}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* AI Model Selection */}

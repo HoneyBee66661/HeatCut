@@ -116,6 +116,8 @@ class AnalyzeRequest(BaseModel):
     subtitles: Optional[str] = Field(None, description="Optional manual subtitles text (SRT or TXT)")
     subtitles_filename: Optional[str] = Field(None, description="Optional manual subtitles filename")
     target_clip_count: Optional[int] = Field(None, description="Optional target number of clips (1-50)")
+    provider: Optional[str] = Field(default="gemini", description="AI provider: 'gemini', 'openai', 'anthropic', or 'openai-compatible'")
+    base_url: Optional[str] = Field(default=None, description="Custom OpenAI-compatible base URL (e.g. https://api.deepseek.com/v1) for provider='openai-compatible'")
     client_heatmap: Optional[List[dict]] = Field(default=None, description="Client-asserted retention heatmap from the device loopback worker (list of {start_time, end_time, value})")
     client_title: Optional[str] = Field(default=None, description="Client-asserted video title from the device loopback worker")
     client_duration: Optional[float] = Field(default=None, description="Client-asserted video duration in seconds from the device loopback worker")
@@ -1061,16 +1063,107 @@ def list_available_models(api_key: str = ""):
         logger.error(f"Error listing models: {e}")
         return {"models": default_models}
 
+def _provider_llm_call(provider: str, model: str, prompt: str, api_key: str, base_url: Optional[str] = None) -> str:
+    """Calls a non-Gemini LLM provider and returns raw text for JSON parsing.
+
+    provider: 'openai' | 'anthropic' | 'openai-compatible'
+    OpenAI-compatible base URL must include the API root, e.g.
+    https://api.openai.com/v1 or https://api.deepseek.com/v1. This one path
+    covers OpenAI, DeepSeek, OpenRouter, Groq, Ollama proxies, etc.
+    """
+    import requests as _rq
+
+    if not api_key:
+        raise ValueError(f"API key required for provider '{provider}' (set it in the app's AI Settings or via {provider.upper()}_API_KEY env).")
+
+    json_instruction = (
+        "\n\nRespond with ONLY a single JSON object, no markdown, no commentary:\n"
+        '{"summary": "1-2 sentence summary with 2-4 hashtags", '
+        '"clips": [{"title": "catchy max 8 words", "start_time": float, '
+        '"end_time": float, "hook_time": float, "virality_score": 1-100, '
+        '"key_quotes": ["quote"], "title_suggestion": "", '
+        '"caption_suggestion": "", "hashtag_suggestion": ""}]}'
+    )
+    user_content = prompt + json_instruction
+
+    if provider == "anthropic":
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": model,
+            "max_tokens": 8192,
+            "temperature": 0.2,
+            "system": "You are a precise viral video clip finder. You always return valid JSON matching the requested schema exactly.",
+            "messages": [{"role": "user", "content": user_content}],
+        }
+    else:
+        base = (base_url or "https://api.openai.com/v1").rstrip("/")
+        if base.endswith("/chat/completions"):
+            url = base
+        else:
+            url = base + "/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+        body = {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "You are a precise viral video clip finder. You always return valid JSON matching the requested schema exactly."},
+                {"role": "user", "content": user_content},
+            ],
+        }
+
+    resp = _rq.post(url, json=body, headers=headers, timeout=150)
+    if resp.status_code != 200:
+        raise ValueError(f"{provider} API error {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    try:
+        if provider == "anthropic":
+            return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"{provider} unexpected response shape: {e}") from e
+
+
+def _parse_json_response(raw_text: str) -> Optional[dict]:
+    """Robustly extracts the first JSON object from an LLM text response."""
+    if not raw_text:
+        return None
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Fallback: find the outermost {...} block (handles stray prose)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            return None
+    return None
+
+
 @app.post("/api/analyze")
 async def analyze_video(request: AnalyzeRequest):
     """Stream real-time progress via Server-Sent Events, then deliver the final result."""
 
     async def stream():
-        gemini_key = (request.api_key or os.environ.get("GEMINI_API_KEY") or '').strip()
+        provider = (request.provider or "gemini").strip().lower()
+        _prov_env = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+                     "anthropic": "ANTHROPIC_API_KEY", "openai-compatible": "OPENAI_API_KEY"}.get(provider, "GEMINI_API_KEY")
+        gemini_key = (request.api_key or os.environ.get(_prov_env) or '').strip()
         is_mock = gemini_key.lower() == "mock"
 
         if not gemini_key:
-            yield _sse({"error": "Gemini API Key is required. Enter it in the web interface.", "status": 400})
+            yield _sse({"error": "AI API key is required. Add it under AI Settings (⚙️), or configure it on the server via env.", "status": 400})
             return
 
         # ── Step 1: Extract video ID & metadata ─────────────────────────────
@@ -1453,25 +1546,26 @@ async def analyze_video(request: AnalyzeRequest):
             "message": f"Assembling prompt and engagement context for {requested_model}..."
         })
 
-        # ── Step 4: Gemini API call with dynamic Flash fallback models and retry ───────────
-        client = genai.Client(api_key=gemini_key)
-        
-        # Discover all available Flash models for the user's API key
-        discovered_flash = await asyncio.to_thread(get_flash_models_for_key, client)
-        
-        # Build models_to_try:
-        # 1. Start with the requested model
-        # 2. Append all discovered and known flash models in version descending order (e.g. 3.7, 3.6, 3.5, 2.5, 2.0, 1.5)
-        #    so all available flash models are tried before giving up
+        # ── Step 4: AI call — Gemini (dynamic Flash fallback) or other provider ──
         models_to_try = [requested_model]
-        for fm in discovered_flash:
-            if fm not in models_to_try:
-                models_to_try.append(fm)
-        for km in KNOWN_FLASH_MODELS:
-            if km not in models_to_try:
-                models_to_try.append(km)
+        if provider == "gemini":
+            client = genai.Client(api_key=gemini_key)
 
-        logger.info(f"Flash fallback chain prepared: {models_to_try}")
+            # Discover all available Flash models for the user's API key
+            discovered_flash = await asyncio.to_thread(get_flash_models_for_key, client)
+
+            # Build models_to_try:
+            # 1. Start with the requested model
+            # 2. Append all discovered and known flash models in version descending order (e.g. 3.7, 3.6, 3.5, 2.5, 2.0, 1.5)
+            #    so all available flash models are tried before giving up
+            for fm in discovered_flash:
+                if fm not in models_to_try:
+                    models_to_try.append(fm)
+            for km in KNOWN_FLASH_MODELS:
+                if km not in models_to_try:
+                    models_to_try.append(km)
+
+        logger.info(f"Provider '{provider}' model chain prepared: {models_to_try}")
 
         response = None
         last_error = None
@@ -1508,17 +1602,26 @@ async def analyze_video(request: AnalyzeRequest):
                     "message": f"Calling {model_name} (attempt {attempt + 1}/{MAX_RETRIES})..."
                 })
                 
-                # Execute Gemini call with heartbeat to keep mobile connection alive and show live stages
-                task = asyncio.create_task(asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=VideoAnalysis,
-                        temperature=0.2,
-                    )
-                ))
+                # Execute the provider call (Gemini structured output, or raw-text
+                # JSON from OpenAI / Anthropic / OpenAI-compatible endpoints)
+                if provider == "gemini":
+                    task = asyncio.create_task(asyncio.to_thread(
+                        client.models.generate_content,
+                        model=model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=VideoAnalysis,
+                            temperature=0.2,
+                        )
+                    ))
+                else:
+                    task = asyncio.create_task(asyncio.to_thread(
+                        _provider_llm_call,
+                        provider, model_name, prompt,
+                        request.api_key or gemini_key,
+                        request.base_url or None,
+                    ))
                 
                 call_start = asyncio.get_event_loop().time()
                 while not task.done():
@@ -1567,10 +1670,12 @@ async def analyze_video(request: AnalyzeRequest):
                 try:
                     resp_candidate = await task
                     last_error = None
-                    
+
                     # Parse structured response
                     parsed_data = None
-                    if hasattr(resp_candidate, 'parsed') and resp_candidate.parsed is not None:
+                    if isinstance(resp_candidate, str):
+                        parsed_data = _parse_json_response(resp_candidate)
+                    elif hasattr(resp_candidate, 'parsed') and resp_candidate.parsed is not None:
                         parsed = resp_candidate.parsed
                         parsed_data = {
                             "summary": getattr(parsed, 'summary', ''),
