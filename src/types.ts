@@ -22,6 +22,9 @@ export interface ViralClip {
   title_suggestion?: string;
   caption_suggestion?: string;
   hashtag_suggestion?: string;
+  signal?: 'retention' | 'text' | 'both';
+  heat_score?: number;
+  text_score?: number;
 }
 
 export interface AnalyzeResponse {

@@ -367,6 +367,29 @@ cheat-clip/
 
 ---
 
+## ☁️ Deploy to Vercel (Free)
+
+The repo ships with `vercel.json` — the frontend builds to `dist/` and `/api/*`
+routes to the FastAPI backend (`backend/main.py`) as serverless functions.
+
+1. Push this fork to GitHub, then import it at vercel.new (Framework: Vite; build
+   command `npm run build` — or let Vercel read `vercel.json`).
+2. Add environment variables in Project → Settings → Environment Variables:
+   - `SUPADATA_API_KEYS` — **required**: YouTube blocks datacenter IPs, so
+     transcripts come from Supadata on Vercel. Free: 100 req/month per key.
+   - `ALLOWED_ORIGINS` — only needed if a *different* site calls your API.
+     Same-origin `/api` calls need no CORS entry.
+   - `PROXY_URL` — optional: needed only to also get the **retention heatmap**
+     on Vercel (Supadata has no heatmap endpoint; heatmap needs yt-dlp via a
+     residential proxy). Without it the app still works — heatmap stays empty.
+3. Deploy. Users open your `.vercel.app` URL and paste their own Gemini key.
+
+Notes for serverless: heavy scrapers (`yt-dlp`, `youtube-transcript-api`) are
+lazy-imported so they never load on Vercel cold starts; the API key stays in the
+visitor's browser (localStorage) — the backend never holds a Gemini key.
+
+---
+
 ## 📄 License
 
 Distributed under the **MIT License**. See `LICENSE` for more information.

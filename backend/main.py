@@ -28,8 +28,10 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
+# NOTE: yt_dlp & youtube_transcript_api are intentionally NOT imported here.
+# They are heavy packages needed only for local/direct scraping; on serverless
+# (Vercel/AWS) they are either blocked or unused. They are lazy-imported inside
+# the functions that need them to keep cold starts lean.
 from google import genai
 from google.genai import types
 # Setup logging
@@ -38,11 +40,29 @@ logger = logging.getLogger("cheat-clip")
 
 app = FastAPI(title="CHEAT CLIP API", description="AI-powered YouTube Viral Hotspot Finder")
 
-# Configure CORS
+# Configure CORS — origins come from ALLOWED_ORIGINS (comma-separated env var).
+# Default (unset): local Vite dev servers only. In production the frontend and
+# API are same-origin (Vercel routes /api to this app), so no entry is needed
+# unless the API is called cross-origin from another site. "*" is an explicit
+# opt-in for open dev setups. allow_credentials is False: the app authenticates
+# with client-supplied keys (localStorage), never cookies.
+def _cors_origins() -> List[str]:
+    raw = (os.environ.get("ALLOWED_ORIGINS") or "").strip()
+    if raw == "*":
+        return ["*"]
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins in development
-    allow_credentials=True,
+    allow_origins=_cors_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -62,6 +82,9 @@ class ViralClip(BaseModel):
     title_suggestion: str = Field(default="", description="Catchy alternative title suggestion")
     caption_suggestion: str = Field(default="", description="Engaging social media caption suggestion")
     hashtag_suggestion: str = Field(default="", description="Relevant hashtags suggestion (e.g. #hashtag1 #hashtag2)")
+    signal: Optional[str] = Field(default=None, description="Evidence source: 'retention', 'text', or 'both'")
+    heat_score: Optional[float] = Field(default=None, description="0-1 retention evidence over the clip range")
+    text_score: Optional[float] = Field(default=None, description="0-1 transcript-structure evidence over the clip range")
 
 class ViralClipGemini(BaseModel):
     title: str = Field(description="Catchy clip title, max 8 words")
@@ -270,6 +293,7 @@ def get_proxy_url() -> Optional[str]:
 
 def fetch_video_metadata(url: str):
     """Fetches video title, duration, and viewer retention heatmap using yt-dlp."""
+    import yt_dlp  # lazy: heavy, only needed for direct scraping
     is_vercel = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
     proxy = get_proxy_url()
     
@@ -302,7 +326,24 @@ def fetch_video_metadata(url: str):
             logger.warning(f"yt-dlp metadata extraction failed (proxy={'yes' if attempt_proxy else 'no'}): {e}")
             continue
 
-    # Fallback to URL video ID parsing if yt-dlp fails
+    # Serverless-friendly fallback: Supadata unified metadata (title + duration only —
+    # Supadata has NO retention-heatmap endpoint, so heatmap stays empty on this path).
+    # Keeps the API functional on Vercel/datacenter IPs where yt-dlp is blocked.
+    try:
+        supadata_meta = fetch_metadata_supadata(url)
+    except Exception as e:
+        logger.warning(f"Supadata metadata fallback failed: {e}")
+        supadata_meta = None
+    if supadata_meta:
+        logger.info("Video metadata loaded via Supadata fallback (title/duration, no heatmap)")
+        return {
+            **supadata_meta,
+            "heatmap": [],
+            "is_live": False,
+            "live_status": "not_live",
+        }
+
+    # Final fallback to URL video ID parsing if everything fails
     video_id = extract_video_id(url)
     if video_id:
         return {
@@ -376,8 +417,58 @@ def fetch_transcript_supadata(video_id: str) -> List[dict]:
     return []
 
 
+def fetch_metadata_supadata(url: str) -> Optional[dict]:
+    """Fetches video title/duration from Supadata's unified /v1/metadata endpoint.
+
+    Serverless-friendly: works from datacenter IPs where yt-dlp is blocked.
+    Returns None when no keys are configured or every attempt fails.
+    NOTE: Supadata exposes no retention-heatmap endpoint — callers receive
+    title/duration only and must treat heatmap as empty on this path.
+    """
+    global _supadata_key_index
+    import requests
+
+    keys = get_supadata_keys()
+    if not keys:
+        return None
+
+    start_idx = _supadata_key_index % len(keys)
+    rotated_keys = keys[start_idx:] + keys[:start_idx]
+    _supadata_key_index = (_supadata_key_index + 1) % len(keys)
+
+    for key in rotated_keys:
+        masked_key = f"{key[:7]}...{key[-4:]}" if len(key) >= 11 else "***"
+        try:
+            response = requests.get(
+                "https://api.supadata.ai/v1/metadata",
+                headers={"x-api-key": key},
+                params={"url": url},
+                timeout=15,
+            )
+            if response.status_code == 200:
+                data = response.json() or {}
+                title = (data.get("title") or "").strip()
+                media = data.get("media") or {}
+                duration = float(media.get("duration") or 0.0)
+                if title:
+                    logger.info(f"Supadata metadata OK ({masked_key}): \"{title[:45]}\" ({int(duration)}s)")
+                    return {"title": title, "duration": duration}
+                logger.warning(f"Supadata metadata response missing title ({masked_key})")
+            elif response.status_code in (429, 402, 403, 401):
+                logger.warning(f"Supadata key {masked_key} returned {response.status_code} (quota/limit). Rotating...")
+                continue
+            else:
+                logger.warning(f"Supadata key {masked_key} returned {response.status_code}: {response.text[:100]}")
+        except Exception as e:
+            logger.warning(f"Supadata metadata request with key {masked_key} failed: {e}")
+            continue
+
+    return None
+
+
 def fetch_transcript_ytdlp(video_id: str) -> List[dict]:
     """Attempts to extract captions using yt-dlp's player response directly (free, no quota used)."""
+    import yt_dlp  # lazy: heavy, only needed for direct scraping
     import requests
     proxy = get_proxy_url()
     ydl_opts = {
@@ -432,6 +523,7 @@ def fetch_transcript_ytdlp(video_id: str) -> List[dict]:
 def fetch_transcript(video_id: str) -> List[dict]:
     """Retrieves subtitles. On Vercel / serverless cloud environments, prioritizes rotating Supadata
     to avoid datacenter IP bans and 10s execution timeouts. Locally, prioritizes free direct fetch."""
+    from youtube_transcript_api import YouTubeTranscriptApi  # lazy: local/direct path only
 
     def to_dict_list(fetched) -> List[dict]:
         return [
@@ -547,6 +639,274 @@ def get_average_heatmap_value(start: float, end: float, heatmap: List[dict]) -> 
             min_dist = dist
             closest_val = point.get('value', 0.0)
     return closest_val
+
+
+# ----------------------------------------------------------------
+# Hybrid evidence: viewer-retention + transcript-structure signals
+# ----------------------------------------------------------------
+# Two independent lenses, both grounded in published / industry practice:
+#   heat = real viewer-rewatch evidence (YouTube player telemetry)
+#   text = transcript-structure evidence — curiosity gaps (Loewenstein),
+#          open loops (Zeigarnik), punchlines/emotional peaks, specificity,
+#          contrast/pattern interrupts, actionable advice. This second lens
+#          catches strong moments on flat-retention videos (podcasts,
+#          lectures, interviews) that pure heatmap mining would miss.
+
+def _heat_evidence(start: float, end: float, heatmap: List[dict]) -> float:
+    """0..1 — retention evidence over [start, end): mean blended toward the peak,
+    so a single strong rewatch spike still registers."""
+    if not heatmap:
+        return 0.0
+    vals = []
+    for p in heatmap:
+        ps = p.get('start_time', 0.0)
+        pe = p.get('end_time', 0.0)
+        pv = p.get('value', 0.0)
+        if max(start, ps) < min(end, pe):
+            vals.append(pv)
+    if not vals:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    peak = max(vals)
+    return round(min(1.0, 0.45 * mean + 0.55 * peak), 3)
+
+
+TEXT_LEXICON = {
+    # Curiosity gap (Loewenstein): info that begs a resolution
+    "curiosity": [
+        "you won't believe", "wait until", "wait till", "here's the thing",
+        "here is the thing", "the problem is", "the reason", "turns out",
+        "secret", "nobody tells you", "nobody talks about", "what happens",
+        "the catch", "i'll show you", "i will show you", "let me show you",
+        "listen to this", "you need to hear", "this is why", "and then",
+    ],
+    # Contrast / pattern interrupt: breaks expected flow
+    "contrast": [
+        "but", "however", "instead", "surprisingly", "actually",
+        "the biggest mistake", "the worst", "the best", "stop doing",
+        "never do", "always do", "i used to", "went from", "big mistake",
+        "huge mistake", "wrong", "changed everything",
+    ],
+    # Emotional peak / punchline: high-arousal words (most-rewatched moments)
+    "emotion": [
+        "insane", "crazy", "amazing", "shocking", "incredible", "terrible",
+        "horrible", "hate", "love", "best", "worst", "never", "always",
+        "literally", "mind-blowing", "game changer", "game-changer",
+        "nightmare", "disaster", "genius", "stupid", "dangerous", "scared",
+        "fear", "hilarious", "ridiculous", "unbelievable", "awesome",
+    ],
+    # Specificity: numbers, units, concrete stakes (beats generalities)
+    "specificity": [
+        "percent", "million", "billion", "thousand", "years", "times",
+        "steps", "ways", "reasons", "mistakes", "secrets", "dollar",
+        "dollars", "hour", "minutes", "days", "months", "episode",
+    ],
+    # Open loop (Zeigarnik): promise of payoff later in the piece
+    "open_loop": [
+        "coming up", "later in this", "stay tuned", "at the end",
+        "in a minute", "in a moment", "the answer", "i'll explain",
+        "i will explain", "stick around", "part 2", "part two",
+        "next video", "hold on", "but first",
+    ],
+    # Actionable value / advice framing
+    "advice": [
+        "you should", "you need to", "you have to", "make sure",
+        "remember", "if you want", "don't forget", "pro tip", "the key",
+        "the trick", "the best way", "how to", "why you", "here's how",
+        "here is how", "number one", "the most important",
+    ],
+    # Laughter cues (punchlines in transcript form)
+    "laughter": [
+        "(laughter)", "(laughs)", "(laughing)", "haha", "hahaha",
+        "lol", "that's funny", "so funny",
+    ],
+}
+_SPECIFICITY_NUM_RE = re.compile(r"(?<!\d)\d{2,}(?:[.,]\d+)?")
+_QUESTION_WORDS = ("who", "what", "why", "how", "when", "where", "is it",
+                   "do you", "did you", "have you", "can you", "will you",
+                   "are you", "would you")
+
+
+def _phrase_hits(low_text: str, phrase: str) -> int:
+    """Count word-boundary occurrences of a phrase in lowercased text."""
+    return len(re.findall(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])", low_text))
+
+
+def _text_evidence(text: str) -> float:
+    """0..1 — structural hook evidence inside one transcript line."""
+    if not text:
+        return 0.0
+    low = " " + text.lower() + " "
+    raw = 0.0
+    cats_hit = 0
+    for cat, words in TEXT_LEXICON.items():
+        cat_count = 0
+        for w in words:
+            cat_count += min(_phrase_hits(low, w), 2)
+        if cat_count:
+            cats_hit += 1
+            raw += min(cat_count, 4)
+    # Numbers carry specificity weight even without a lexicon word
+    num_hits = min(len(_SPECIFICITY_NUM_RE.findall(low)), 3)
+    if num_hits:
+        raw += num_hits * 0.8
+        cats_hit += 0  # counted within raw only
+    # Direct question = built-in curiosity device
+    if "?" in low:
+        raw += 1.2
+        cats_hit += 1
+    elif any(_phrase_hits(low, q) for q in _QUESTION_WORDS):
+        raw += 0.8
+        cats_hit += 1
+    if raw <= 0:
+        return 0.0
+    # Saturating transform: more distinct categories >> repeated same word
+    score = 1.0 - 1.0 / (1.0 + (0.55 * raw + 0.65 * cats_hit))
+    return round(min(1.0, score), 3)
+
+
+def _line_end(line: dict) -> float:
+    return float(line.get("end", line.get("start", 0.0) + line.get("duration", 0.0)))
+
+
+def _lines_in(start: float, end: float, lines: List[dict]) -> List[dict]:
+    return [
+        l for l in lines
+        if max(start, float(l.get("start", 0.0))) < min(end, _line_end(l))
+    ]
+
+
+def _window_text(lines: List[dict]) -> str:
+    return " ".join(l.get("text", "") for l in lines if l.get("text")).strip()
+
+
+def _window_text_evidence(lines: List[dict]) -> float:
+    vals = [_text_evidence(l.get("text", "")) for l in lines]
+    return max(vals, default=0.0)
+
+
+def _overlaps(a_start: float, a_end: float, b_start: float, b_end: float, threshold: float = 0.45) -> bool:
+    inter = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+    union = max(a_end, b_end) - min(a_start, b_start)
+    if union <= 0:
+        return False
+    return (inter / union) > threshold
+
+
+def _title_from_text(text: str, max_words: int = 8) -> str:
+    """Deterministic title for text-detected clips (no LLM call)."""
+    words = re.split(r"\s+", (text or "").strip())
+    words = [w for w in words if w][:max_words]
+    if not words:
+        return "Interesting moment"
+    title = " ".join(words).strip(" ,.;:-")
+    if len(title) > 60:
+        title = title[:60].rsplit(" ", 1)[0] + "…"
+    return title[:1].upper() + title[1:]
+
+
+def annotate_and_extend_clips(
+    clips: List[ViralClip],
+    lines: List[dict],
+    heatmap: List[dict],
+    target_secs: float,
+    max_text_only: int = 6,
+) -> List[ViralClip]:
+    """Attach hybrid evidence to every clip (signal source + heat/text scores) and
+    append text-only candidates: transcript windows with strong structural hook
+    evidence but weak/no retention spike (the flat-retention safety net)."""
+    covered = []
+    out = []
+    for c in clips:
+        s, e = float(c.start_time), float(c.end_time)
+        heat = _heat_evidence(s, e, heatmap)
+        ls = _lines_in(s, e, lines)
+        txt = _window_text_evidence(ls)
+        c.heat_score = heat
+        c.text_score = txt
+        if heat >= 0.35 and txt >= 0.25:
+            c.signal = "both"
+        elif heat >= 0.35:
+            c.signal = "retention"
+        elif txt >= 0.30:
+            c.signal = "text"
+        else:
+            c.signal = None
+        out.append(c)
+        covered.append((s, e))
+
+    if not lines:
+        return out
+
+    min_dur = max(6.0, target_secs * 0.45)
+    max_dur = target_secs * 1.9
+    n = len(lines)
+
+    # Seed windows: contiguous runs of lines with strong text evidence
+    scored_idx = [i for i, l in enumerate(lines) if _text_evidence(l.get("text", "")) >= 0.30]
+    if not scored_idx:
+        return out
+    groups = []
+    cur = [scored_idx[0]]
+    for i in scored_idx[1:]:
+        if i - cur[-1] <= 2:
+            cur.append(i)
+        else:
+            groups.append(cur)
+            cur = [i]
+    groups.append(cur)
+
+    candidates = []
+    for g in groups:
+        lo, hi = g[0], g[-1]
+
+        def win_dur() -> float:
+            return _line_end(lines[hi]) - float(lines[lo].get("start", 0.0))
+
+        # Expand the window to a usable clip length (but never over max_dur)
+        while lo > 0 and win_dur() < min_dur:
+            lo -= 1
+        while hi < n - 1 and win_dur() < min_dur:
+            hi += 1
+        s = float(lines[lo].get("start", 0.0))
+        e = _line_end(lines[hi])
+        if e - s < min_dur * 0.6 or e - s > max_dur:
+            continue
+        if any(_overlaps(s, e, a, b) for a, b in covered):
+            continue
+
+        group_lines = lines[g[0]:g[-1] + 1]
+        txt = _window_text_evidence(group_lines)
+        heat = _heat_evidence(s, e, heatmap)
+        if txt < 0.40:
+            continue
+        composite = round(min(1.0, 0.62 * txt + 0.38 * heat) * 100)
+        hook_line = max(group_lines, key=lambda l: _text_evidence(l.get("text", "")))
+        seg_lines = _lines_in(s, e, lines)
+        quotes = sorted(
+            seg_lines, key=lambda l: _text_evidence(l.get("text", "")), reverse=True
+        )[:2]
+        seg_text = _window_text(seg_lines)
+        candidates.append(ViralClip(
+            title=_title_from_text(quotes[0].get("text", "") if quotes else seg_text),
+            start_time=round(s, 2),
+            end_time=round(e, 2),
+            hook_time=round(float(hook_line.get("start", s)), 2),
+            virality_score=max(1, composite),
+            key_quotes=[q.get("text", "") for q in quotes if q.get("text")],
+            transcript=seg_text,
+            signal="text" if heat < 0.35 else "both",
+            heat_score=heat,
+            text_score=txt,
+        ))
+
+    candidates.sort(key=lambda c: c.virality_score, reverse=True)
+    for c in candidates[:max_text_only]:
+        out.append(c)
+        covered.append((c.start_time, c.end_time))
+
+    out.sort(key=lambda c: c.virality_score, reverse=True)
+    return out
 
 # ----------------------------------------------------------------
 # Routes
@@ -974,6 +1334,15 @@ async def analyze_video(request: AnalyzeRequest):
                              value=float(pt.get('value',0.0)))
                 for pt in heatmap
             ]
+            # Hybrid evidence pass (labels + text-only candidates) so mock mode
+            # demos the same signal model as the real pipeline.
+            _mock_target = {"15s": 18, "30s": 32, "60s": 60}.get(request.duration, 32)
+            mock_clips = annotate_and_extend_clips(
+                mock_clips,
+                transcript_lines,
+                [pt.model_dump() for pt in mock_heatmap],
+                _mock_target,
+            )
             result = AnalyzeResponse(
                 video_id=video_id, title=title, duration=duration or 200.0,
                 heatmap=mock_heatmap,
@@ -986,7 +1355,7 @@ async def analyze_video(request: AnalyzeRequest):
                 "step_progress": 100,
                 "overall_progress": 100,
                 "stage": "Analysis Complete",
-                "detail": "Generated 3 viral clip candidates successfully.",
+                "detail": f"Generated {len(mock_clips)} clip candidates successfully.",
                 "done": True,
                 "result": result.model_dump()
             })
@@ -1022,7 +1391,8 @@ async def analyze_video(request: AnalyzeRequest):
         transcript_text = "\n".join(transcript_dump)
         dur_range   = {"15s": "10-20s", "30s": "20-40s", "60s": "45-75s"}.get(request.duration, "20-40s")
         heatmap_note = (
-            "Columns: start|end|audience_interest(0-1). Prioritise high-interest peaks."
+            "Columns: start|end|audience_interest(0-1). Higher = viewers actually REWATCHED that moment. "
+            "Treat sustained high-interest peaks as strong evidence and prefer clip windows that contain them."
             if heatmap else
             "No audience interest data. Use content hooks, energy, and story arcs."
         )
@@ -1039,8 +1409,17 @@ async def analyze_video(request: AnalyzeRequest):
             f"{focus_instruction}"
             f"Match output language to transcript language.\n\n"
             f"Transcript (start|end[|interest] text):\n---\n{transcript_text}\n---\n\n"
+            f"SELECTION RUBRIC — proven viral-clip structure (relative weight):\n"
+            f"1) Curiosity gap / open loop (25): the moment opens a question or promise the viewer must see resolved.\n"
+            f"2) Punchline / emotional peak (20): joke payoff, strong opinion, surprise, high-arousal statement (the most-rewatched moments).\n"
+            f"3) Self-contained (15): makes sense with ZERO context — no 'as I said earlier', no dangling pronouns.\n"
+            f"4) Specificity (15): numbers, names, concrete claims — beats generalities.\n"
+            f"5) Standalone value (15): a real insight, warning, or actionable tip even without visuals.\n"
+            f"6) Contrast / pattern interrupt (10): 'but / actually / the problem is' shifts that break expected flow.\n"
+            f"Score every candidate 1-100 against this rubric (virality_score).\n"
             f"Rules: use exact seconds from transcript; clips must start/end at sentence boundaries; do not overlap.\n"
-            f"Return {clip_range} clips sorted by virality_score desc."
+            f"hook_time must equal the timestamp of the first sentence that creates the hook.\n"
+            f"Return {clip_range} clips sorted by virality_score desc.\n"
         )
 
         requested_model = (request.model or 'gemini-2.5-flash').strip()
@@ -1380,6 +1759,16 @@ async def analyze_video(request: AnalyzeRequest):
                 hashtag_suggestion=hashtag_sug
             ))
 
+        # Hybrid evidence pass: label every clip with its signal source
+        # (retention / text / both), attach heat+text evidence scores, and
+        # append text-only candidates — moments with strong transcript
+        # structure but no retention spike (flat-retention safety net).
+        target_secs = {"15s": 18, "30s": 32, "60s": 60}.get(request.duration, 32)
+        final_clips = annotate_and_extend_clips(
+            final_clips, enriched_transcript, heatmap or [], target_secs
+        )
+        logger.info(f"Hybrid pass complete — {len(final_clips)} clips after evidence labeling + text-only candidates.")
+
         response_heatmap = [
             HeatmapPoint(
                 start_time=float(pt.get('start_time', 0.0)),
@@ -1423,5 +1812,99 @@ async def analyze_video(request: AnalyzeRequest):
             "Connection":    "keep-alive",
             "X-Accel-Buffering": "no",
         }
+    )
+
+
+# ----------------------------------------------------------------
+# Clip export: raw segment download (yt-dlp + ffmpeg stream-copy)
+# ----------------------------------------------------------------
+class ExportRequest(BaseModel):
+    video_id: str = Field(..., description="YouTube video ID")
+    start_time: float = Field(..., ge=0, description="Clip start in seconds")
+    end_time: float = Field(..., gt=0, description="Clip end in seconds")
+    title: Optional[str] = Field(default=None, description="Optional video title used for the download filename")
+
+
+@app.post("/api/export")
+async def export_clip(request: ExportRequest):
+    """Cuts a RAW clip from the source video — stream-copy, no re-encode, no
+    crop, original resolution/quality — and serves it as a normal mp4 download.
+
+    CapCut exposes no public automation API, so the handoff is a plain file
+    download that the user imports into CapCut manually. Stream-copy keeps the
+    cut lossless and instant; accuracy is keyframe-aligned (~1-2s), acceptable
+    for a raw segment that gets trimmed in the editor anyway.
+    """
+    if request.end_time <= request.start_time:
+        raise HTTPException(status_code=400, detail="end_time must be greater than start_time.")
+    if request.end_time - request.start_time > 3600:
+        raise HTTPException(status_code=400, detail="Clip too long (max 60 minutes).")
+
+    import shutil
+    import subprocess
+    import tempfile
+    from starlette.background import BackgroundTask
+
+    tmpdir = tempfile.mkdtemp(prefix="cc_export_")
+
+    def _run() -> str:
+        import yt_dlp  # lazy: heavy scraping package
+        url = f"https://www.youtube.com/watch?v={request.video_id}"
+        outtmpl = os.path.join(tmpdir, "src.%(ext)s")
+        ydl_opts = {
+            "format": "bv*[height<=?1080]+ba/b[height<=?1080]/b",
+            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "socket_timeout": 15,
+            "retries": 3,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        src = None
+        for f in sorted(os.listdir(tmpdir)):
+            if f.startswith("src."):
+                src = os.path.join(tmpdir, f)
+                break
+        if not src:
+            raise ValueError("Could not download the source video.")
+
+        out_mp4 = os.path.join(tmpdir, "clip.mp4")
+        dur = request.end_time - request.start_time
+        cmd = [
+            "ffmpeg", "-y", "-ss", f"{request.start_time:.3f}", "-i", src,
+            "-t", f"{dur:.3f}", "-c", "copy", "-avoid_negative_ts", "make_zero",
+            "-map", "0", out_mp4,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        if proc.returncode != 0 or not os.path.exists(out_mp4) or os.path.getsize(out_mp4) == 0:
+            # Frame-accurate fallback: re-encode the segment (slower, exact).
+            cmd2 = [
+                "ffmpeg", "-y", "-ss", f"{request.start_time:.3f}", "-i", src,
+                "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "veryfast",
+                "-crf", "20", "-c:a", "aac", "-b:a", "128k", "-map", "0", out_mp4,
+            ]
+            proc2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=1800)
+            if proc2.returncode != 0 or not os.path.exists(out_mp4) or os.path.getsize(out_mp4) == 0:
+                err = (proc2.stderr or proc.stderr or "unknown ffmpeg error")[-300:]
+                raise ValueError(f"ffmpeg cut failed: {err}")
+        return out_mp4
+
+    try:
+        out_mp4 = await asyncio.to_thread(_run)
+    except Exception as e:  # noqa: BLE001 — surface a clean API error to the client
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+
+    base = (request.title or "").strip() or f"clip-{request.video_id}"
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", base).strip("-").lower()[:60] or f"clip-{request.video_id}"
+    filename = f"{slug}-{int(request.start_time)}-{int(request.end_time)}s.mp4"
+    return FileResponse(
+        out_mp4,
+        media_type="video/mp4",
+        filename=filename,
+        background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
     )
 

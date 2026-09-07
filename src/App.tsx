@@ -5,9 +5,41 @@ import { useLanguage } from './locales';
 import type { AnalyzeResponse, ViralClip } from './types';
 
 // Declare YT global variables for TypeScript
+type YTPlayerInstance = {
+  destroy: () => void;
+  loadVideoById: (videoId: string) => void;
+  getCurrentTime: () => number;
+  seekTo: (seconds: number, allowSeekAhead: boolean) => void;
+  getPlayerState: () => number;
+  playVideo: () => void;
+  pauseVideo: () => void;
+};
+
+type YTPlayerOptions = {
+  videoId: string;
+  playerVars: Record<string, number>;
+  events: {
+    onReady?: () => void;
+    onStateChange?: (event: { data: number }) => void;
+  };
+};
+
+type StreamEvent = {
+  step?: number;
+  step_progress?: number;
+  overall_progress?: number;
+  stage?: string;
+  detail?: string;
+  message?: string;
+  model?: string;
+  error?: string;
+  done?: boolean;
+  result?: AnalyzeResponse;
+};
+
 declare global {
   interface Window {
-    YT: any;
+    YT: { Player: new (elementId: string, options: YTPlayerOptions) => YTPlayerInstance };
     onYouTubeIframeAPIReady: (() => void) | undefined;
   }
 }
@@ -135,6 +167,7 @@ export default function App() {
 
   // Assistance feature: Checklist for marked clips
   const [markedClips, setMarkedClips] = useState<Record<string, boolean>>({});
+  const [exportingClipKey, setExportingClipKey] = useState<string | null>(null);
   const [loadingDetails, setLoadingDetails] = useState('');
 
   // History feature: previously analyzed videos from localStorage
@@ -158,7 +191,7 @@ export default function App() {
 
   // Audio/video playback state tracking
   const [currentTime, setCurrentTime] = useState(0);
-  const playerRef = useRef<any>(null);
+  const playerRef = useRef<YTPlayerInstance | null>(null);
   const trackingInterval = useRef<number | null>(null);
   const clipEndIntervalRef = useRef<number | null>(null);
   const loadingSectionRef = useRef<HTMLElement | null>(null);
@@ -194,34 +227,6 @@ export default function App() {
       return () => clearTimeout(scrollTimer);
     }
   }, [loading]);
-
-  // Initialize YouTube IFrame API
-  useEffect(() => {
-    // Check if script is already injected
-    const existingScript = document.getElementById('youtube-iframe-api-script');
-    if (!existingScript) {
-      const tag = document.createElement('script');
-      tag.id = 'youtube-iframe-api-script';
-      tag.src = 'https://www.youtube.com/iframe_api';
-      const firstScriptTag = document.getElementsByTagName('script')[0];
-      firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
-    }
-
-    // Set global callback
-    window.onYouTubeIframeAPIReady = () => {
-      // Re-trigger player init if a result is already loaded
-      if (result) {
-        initPlayer(result.video_id);
-      }
-    };
-
-    return () => {
-      stopTracking();
-      if (clipEndIntervalRef.current !== null) {
-        clearInterval(clipEndIntervalRef.current);
-      }
-    };
-  }, [result]);
 
   // Fetch available AI models when API key is detected/entered
   useEffect(() => {
@@ -266,7 +271,7 @@ export default function App() {
       if (saved) {
         try {
           setMarkedClips(JSON.parse(saved));
-        } catch (_) {
+        } catch {
           setMarkedClips({});
         }
       } else {
@@ -314,8 +319,8 @@ export default function App() {
           // Try reading cached timestamp stored separately
           const tsKey = `cheat_clip_ts_${video_id}_${duration_pref}${range_suffix}`;
           const analyzed_at = localStorage.getItem(tsKey) || new Date().toISOString();
-          const clip_titles = (data.clips || []).map((c: any) => c.title || '').filter(Boolean);
-          const key_quotes = (data.clips || []).flatMap((c: any) => c.key_quotes || []).filter(Boolean);
+          const clip_titles = (data.clips || []).map((c) => c.title || '').filter(Boolean);
+          const key_quotes = (data.clips || []).flatMap((c) => c.key_quotes || []).filter(Boolean);
 
           entries.push({
             video_id,
@@ -330,7 +335,7 @@ export default function App() {
             clip_titles,
             key_quotes
           });
-        } catch (_) {
+        } catch {
           // Skip malformed entries
         }
       }
@@ -412,7 +417,7 @@ export default function App() {
           setTimeout(() => initPlayer(data.video_id, true), 150);
         }, 500);
       }, 600);
-    } catch (_) {
+    } catch {
       setToastMessage(t.form.historyLoadFailed);
       setTimeout(() => setToastMessage(null), 3000);
     }
@@ -475,7 +480,7 @@ export default function App() {
     }
   };
 
-  const initPlayer = (videoId: string, forceRecreate = false) => {
+  function initPlayer(videoId: string, forceRecreate = false) {
     // If player already exists and we're not forcing recreate, try to load new video
     if (!forceRecreate && playerRef.current && typeof playerRef.current.loadVideoById === 'function') {
       try {
@@ -518,7 +523,7 @@ export default function App() {
             onReady: () => {
               console.log('YouTube Player Ready');
             },
-            onStateChange: (event: any) => {
+            onStateChange: (event: { data: number }) => {
               // YT.PlayerState.PLAYING = 1
               if (event.data === 1) {
                 startTracking();
@@ -541,7 +546,7 @@ export default function App() {
       // Try again in 200ms if global window.YT is not ready yet
       setTimeout(() => initPlayer(videoId, forceRecreate), 200);
     }
-  };
+  }
 
   const startTracking = () => {
     stopTracking();
@@ -552,12 +557,43 @@ export default function App() {
     }, 200);
   };
 
-  const stopTracking = () => {
+  function stopTracking() {
     if (trackingInterval.current !== null) {
       clearInterval(trackingInterval.current);
       trackingInterval.current = null;
     }
-  };
+  }
+
+  // Initialize YouTube IFrame API. Placed after the player helpers above so
+  // their latest per-render versions are visible (react-hooks/immutability).
+  useEffect(() => {
+    // Check if script is already injected
+    const existingScript = document.getElementById('youtube-iframe-api-script');
+    if (!existingScript) {
+      const tag = document.createElement('script');
+      tag.id = 'youtube-iframe-api-script';
+      tag.src = 'https://www.youtube.com/iframe_api';
+      const firstScriptTag = document.getElementsByTagName('script')[0];
+      firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
+    }
+
+    // Set global callback. The YouTube IFrame API contract requires the
+    // ready-callback to live on window; it is set inside this effect.
+    // eslint-disable-next-line react-hooks/immutability -- external global protocol
+    window.onYouTubeIframeAPIReady = () => {
+      // Re-trigger player init if a result is already loaded
+      if (result) {
+        initPlayer(result.video_id);
+      }
+    };
+
+    return () => {
+      stopTracking();
+      if (clipEndIntervalRef.current !== null) {
+        clearInterval(clipEndIntervalRef.current);
+      }
+    };
+  }, [result]);
 
   const handleSeek = (seconds: number) => {
     if (playerRef.current && typeof playerRef.current.seekTo === 'function') {
@@ -603,8 +639,8 @@ export default function App() {
 
   const extractVideoId = (urlStr: string): string | null => {
     const patterns = [
-      /(?:v=|\/v\/|embed\/|shorts\/|youtu\.be\/|\/embed\/|\/watch\?v=|\/watch\?.+&v=)([^#\&\?]{11})/,
-      /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([^#\&\?]{11})/
+      /(?:v=|\/v\/|embed\/|shorts\/|youtu\.be\/|\/embed\/|\/watch\?v=|\/watch\?.+&v=)([^#&?]{11})/,
+      /^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([^#&?]{11})/
     ];
     for (const pattern of patterns) {
       const match = urlStr.match(pattern);
@@ -776,7 +812,7 @@ export default function App() {
         for (const part of parts) {
           for (const line of part.split('\n')) {
             if (!line.startsWith('data: ')) continue;
-            let event: any;
+            let event: StreamEvent;
             try { event = JSON.parse(line.slice(6)); } catch { continue; }
 
             if (event.error) {
@@ -839,8 +875,9 @@ export default function App() {
                 setOverallProgress(100);
                 break;
               }
-            } catch (err: any) {
-              if (err.message && !err.message.includes('JSON')) throw err;
+            } catch (err) {
+              const message = err instanceof Error ? err.message : '';
+              if (message && !message.includes('JSON')) throw err;
             }
           }
           if (resultData) break;
@@ -881,8 +918,9 @@ export default function App() {
         }
       }, 250);
 
-    } catch (err: any) {
-      setError(err.message || 'An unexpected error occurred during analysis.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message || 'An unexpected error occurred during analysis.');
       setLoading(false);
     }
   };
@@ -951,6 +989,47 @@ Transcript:
         setToastMessage(null);
       }, 3000);
     });
+  };
+
+  const handleDownloadClip = async (clip: ViralClip) => {
+    if (!result || exportingClipKey) return;
+    const key = `${result.video_id}-${clip.start_time}-${clip.end_time}`;
+    setExportingClipKey(key);
+    setToastMessage(t.results.preparingDownload);
+    try {
+      const resp = await fetch('/api/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          video_id: result.video_id,
+          start_time: clip.start_time,
+          end_time: clip.end_time,
+          title: result.title,
+        }),
+      });
+      if (!resp.ok) {
+        const detail = await resp.json().catch(() => null);
+        throw new Error(detail?.detail || t.results.exportFailed);
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const cd = resp.headers.get('content-disposition') || '';
+      const m = cd.match(/filename="?([^";]+)"?/i);
+      a.href = url;
+      a.download = m ? m[1] : `clip-${result.video_id}-${Math.round(clip.start_time)}-${Math.round(clip.end_time)}s.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      setToastMessage(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setToastMessage(msg);
+      setTimeout(() => setToastMessage(null), 4500);
+    } finally {
+      setExportingClipKey(null);
+    }
   };
 
   const handleCopyTimestamp = (clip: ViralClip, e?: React.MouseEvent) => {
@@ -2523,7 +2602,7 @@ Transcript:
                 <select
                   className="form-input virality-filter-select"
                   value={viralityFilter}
-                  onChange={(e) => setViralityFilter(e.target.value as any)}
+                  onChange={(e) => setViralityFilter(e.target.value as 'all' | 'high' | 'medium' | 'marked')}
                   style={{ width: 'auto', padding: '0.6rem 2rem 0.6rem 1rem', fontSize: '0.875rem', cursor: 'pointer' }}
                 >
                   <option value="all">{t.results.filterAllScores}</option>
@@ -2535,7 +2614,7 @@ Transcript:
                 <select
                   className="form-input virality-filter-select"
                   value={sortBy}
-                  onChange={(e) => setSortBy(e.target.value as any)}
+                  onChange={(e) => setSortBy(e.target.value as 'virality' | 'time' | 'duration' | 'marked')}
                   style={{ width: 'auto', padding: '0.6rem 2rem 0.6rem 1rem', fontSize: '0.875rem', cursor: 'pointer' }}
                 >
                   <option value="virality">{t.results.sortVirality}</option>
@@ -2638,7 +2717,7 @@ Transcript:
                         </div>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', flex: 1 }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-                            <span className="clip-title" style={{ color: !!markedClips[`${clip.start_time}_${clip.end_time}`] ? 'var(--secondary)' : 'var(--text-primary)', opacity: 1 }}>
+                            <span className="clip-title" style={{ color: markedClips[`${clip.start_time}_${clip.end_time}`] ? 'var(--secondary)' : 'var(--text-primary)', opacity: 1 }}>
                               {clip.title}
                             </span>
                             <button
@@ -2817,6 +2896,29 @@ Transcript:
                         </button>
 
                         <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                          {clip.signal && (
+                            <span
+                              style={{
+                                fontSize: '0.7rem', fontWeight: 'bold', padding: '2px 9px',
+                                borderRadius: '10px', whiteSpace: 'nowrap',
+                                color: clip.signal === 'retention' ? '#ff8a80' : clip.signal === 'text' ? '#ffd54f' : '#69f0ae',
+                                background: clip.signal === 'retention' ? 'rgba(255,138,128,0.12)' : clip.signal === 'text' ? 'rgba(255,213,79,0.12)' : 'rgba(105,240,174,0.12)',
+                                border: `1px solid ${clip.signal === 'retention' ? 'rgba(255,138,128,0.35)' : clip.signal === 'text' ? 'rgba(255,213,79,0.35)' : 'rgba(105,240,174,0.35)'}`,
+                              }}
+                            >
+                              {clip.signal === 'retention' ? t.results.signalRetention : clip.signal === 'text' ? t.results.signalText : t.results.signalBoth}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            className="form-input"
+                            style={{ padding: '0.45rem 0.85rem', fontSize: '0.8rem', width: 'auto', borderRadius: '8px', cursor: exportingClipKey ? 'wait' : 'pointer', background: 'transparent', opacity: exportingClipKey ? 0.6 : 1 }}
+                            onClick={(e) => { e.stopPropagation(); handleDownloadClip(clip); }}
+                            disabled={!!exportingClipKey}
+                            title={t.results.downloadClip}
+                          >
+                            {exportingClipKey === `${result?.video_id}-${clip.start_time}-${clip.end_time}` ? '⏳…' : t.results.downloadClip}
+                          </button>
                           <button
                             type="button"
                             className="form-input"
