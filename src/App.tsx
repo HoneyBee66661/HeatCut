@@ -1064,27 +1064,60 @@ Transcript:
     setExportingClipKey(key);
     setToastMessage(t.results.preparingDownload);
     try {
-      const resp = await fetch('/api/export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          video_id: result.video_id,
-          start_time: clip.start_time,
-          end_time: clip.end_time,
-          title: result.title,
-        }),
-      });
-      if (!resp.ok) {
-        const detail = await resp.json().catch(() => null);
-        throw new Error(detail?.detail || t.results.exportFailed);
+      // Prefer the DEVICE WORKER for downloads: on cloud deploys (Vercel)
+      // the server cannot scrape YouTube (datacenter IPs are bot-blocked),
+      // but a worker running on this same device (http://127.0.0.1:8765,
+      // loopback is exempt from mixed-content) downloads over the user's
+      // residential connection and streams the file straight to this tab.
+      let workerOnline = false;
+      try {
+        const probe = await fetch(`${HEATMAP_WORKER_URL}/health`, { signal: AbortSignal.timeout(400) });
+        workerOnline = probe.ok;
+      } catch {
+        workerOnline = false;
       }
-      const blob = await resp.blob();
+
+      let blob: Blob;
+      let filename: string;
+      if (workerOnline) {
+        const qs = new URLSearchParams({
+          video_id: result.video_id,
+          start_time: String(clip.start_time),
+          end_time: String(clip.end_time),
+          title: result.title,
+        }).toString();
+        const resp = await fetch(`${HEATMAP_WORKER_URL}/export?${qs}`);
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => null);
+          throw new Error(detail?.detail || t.results.exportFailed);
+        }
+        blob = await resp.blob();
+        filename = `heatcut-${result.video_id}-${Math.round(clip.start_time)}-${Math.round(clip.end_time)}s.mp4`;
+      } else {
+        const resp = await fetch('/api/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            video_id: result.video_id,
+            start_time: clip.start_time,
+            end_time: clip.end_time,
+            title: result.title,
+          }),
+        });
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => null);
+          throw new Error(detail?.detail || t.results.exportFailed);
+        }
+        blob = await resp.blob();
+        const cd = resp.headers.get('content-disposition') || '';
+        const m = cd.match(/filename="?([^";]+)"?/i);
+        filename = m ? m[1] : `clip-${result.video_id}-${Math.round(clip.start_time)}-${Math.round(clip.end_time)}s.mp4`;
+      }
+
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      const cd = resp.headers.get('content-disposition') || '';
-      const m = cd.match(/filename="?([^";]+)"?/i);
       a.href = url;
-      a.download = m ? m[1] : `clip-${result.video_id}-${Math.round(clip.start_time)}-${Math.round(clip.end_time)}s.mp4`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();

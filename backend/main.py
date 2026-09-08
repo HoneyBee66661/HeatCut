@@ -1145,7 +1145,8 @@ def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) 
     for f in formats:
         if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
                 and f.get("protocol") == "https" and f.get("ext") == "mp4"
-                and f.get("url") and (f.get("height") or 0) > v_h):
+                and f.get("url") and 0 < (f.get("height") or 0) <= 1080
+                and (f.get("height") or 0) > v_h):
             vfmt = f
             v_h = f.get("height") or 0
     afmt = None
