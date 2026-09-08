@@ -56,6 +56,7 @@ export default function App() {
   const { t } = useLanguage();
   const [url, setUrl] = useState('');
   const [durationPref, setDurationPref] = useState<'15s' | '30s' | '60s'>('30s');
+  const [sourceMode, setSourceMode] = useState<'auto' | 'podcast' | 'concert'>('auto');
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('cheat_clip_gemini_api_key') || '');
   const [showApiKey, setShowApiKey] = useState(false);
 
@@ -842,6 +843,7 @@ export default function App() {
         body: JSON.stringify({
           url: url.trim(),
           duration: durationPref,
+          mode: sourceMode,
           api_key: apiKey.trim() || undefined,
           model: selectedModel,
           custom_prompt: customPrompt.trim() || undefined,
@@ -1571,6 +1573,47 @@ Transcript:
               <h3 style={{ fontSize: '0.9rem', color: 'var(--secondary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.25rem' }}>
                 ⚡ {t.form.clipCustomizationTitle}
               </h3>
+
+              {/* Source Mode Selector (auto / podcast / concert) */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t.form.sourceMode}</label>
+                <div className="duration-selector" id="source-mode-group">
+                  <button
+                    type="button"
+                    id="mode-auto"
+                    className={`duration-btn ${sourceMode === 'auto' ? 'active' : ''}`}
+                    onClick={() => setSourceMode('auto')}
+                    disabled={loading}
+                  >
+                    {t.form.modeAuto}
+                  </button>
+                  <button
+                    type="button"
+                    id="mode-podcast"
+                    className={`duration-btn ${sourceMode === 'podcast' ? 'active' : ''}`}
+                    onClick={() => setSourceMode('podcast')}
+                    disabled={loading}
+                  >
+                    {t.form.modePodcast}
+                  </button>
+                  <button
+                    type="button"
+                    id="mode-concert"
+                    className={`duration-btn ${sourceMode === 'concert' ? 'active' : ''}`}
+                    onClick={() => setSourceMode('concert')}
+                    disabled={loading}
+                  >
+                    {t.form.modeConcert}
+                  </button>
+                </div>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                  {sourceMode === 'auto'
+                    ? t.form.modeAutoDesc
+                    : sourceMode === 'podcast'
+                      ? t.form.modePodcastDesc
+                      : t.form.modeConcertDesc}
+                </span>
+              </div>
 
               {/* Preferred Duration Selector */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>

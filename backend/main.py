@@ -20,6 +20,7 @@ load_dotenv(os.path.join(_base_dir, "..", ".env"))
 load_dotenv()
 
 import re
+import math
 import logging
 import asyncio
 import json
@@ -118,6 +119,7 @@ class AnalyzeRequest(BaseModel):
     target_clip_count: Optional[int] = Field(None, description="Optional target number of clips (1-50)")
     provider: Optional[str] = Field(default="gemini", description="AI provider: 'gemini', 'openai', 'anthropic', or 'openai-compatible'")
     base_url: Optional[str] = Field(default=None, description="Custom OpenAI-compatible base URL (e.g. https://api.deepseek.com/v1) for provider='openai-compatible'")
+    mode: Optional[str] = Field(default="auto", description="Analysis mode: 'auto' (default — detect transcript, fall back to heatmap-only when unavailable), 'podcast' (transcript required, text-first), 'concert' (heatmap-only — skip transcript entirely)")
     client_heatmap: Optional[List[dict]] = Field(default=None, description="Client-asserted retention heatmap from the device loopback worker (list of {start_time, end_time, value})")
     client_title: Optional[str] = Field(default=None, description="Client-asserted video title from the device loopback worker")
     client_duration: Optional[float] = Field(default=None, description="Client-asserted video duration in seconds from the device loopback worker")
@@ -810,6 +812,151 @@ def _title_from_text(text: str, max_words: int = 8) -> str:
     return title[:1].upper() + title[1:]
 
 
+# ----------------------------------------------------------------
+# Heatmap-only clip mining (concert mode / no-transcript fallback)
+# ----------------------------------------------------------------
+# Pure-retention selection: resample heatmap marks onto a dense time
+# grid, smooth, and compare against a LONG local baseline — concerts
+# are loud everywhere, so what matters is a moment standing out from
+# its OWN neighborhood (3-min baseline), not an absolute threshold.
+# Then pick local maxima, build clip windows, and non-max suppress.
+
+def _fmt_ts(sec: float) -> str:
+    sec = max(0, int(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+def _heatmap_peaks(heatmap: List[dict], duration: float, target_secs: float,
+                   count: int, start_bound: float = 0.0,
+                   end_bound: Optional[float] = None) -> List[dict]:
+    """Return clip-window dicts for the strongest retention peaks.
+
+    Each dict: {start, end, hook (peak second), heat (0-1 evidence),
+    score (0-1 composite), z (relative prominence)}. Sorted by score.
+    """
+    if not heatmap or duration <= 0 or count <= 0:
+        return []
+    end_bound = min(end_bound if end_bound is not None else duration, duration)
+    span = end_bound - start_bound
+    if span < 8:
+        return []
+
+    # 1) Dense grid (dt=2s; coarser only if the video is very short)
+    dt = 2.0
+    n = int(math.ceil(span / dt))
+    if n < 12:
+        dt = span / 12.0
+        n = 12
+    grid = [0.0] * n
+    for p in heatmap:
+        ps = float(p.get("start_time", 0.0))
+        pe = float(p.get("end_time", 0.0))
+        pv = float(p.get("value", 0.0))
+        lo = max(0, int(math.floor((ps - start_bound) / dt)))
+        hi = min(n - 1, int(math.floor((pe - start_bound) / dt)))
+        for i in range(lo, hi + 1):
+            cell_s = start_bound + i * dt
+            cell_e = min(cell_s + dt, end_bound)
+            if max(cell_s, ps) < min(cell_e, pe):
+                grid[i] = pv  # marks tile the timeline; last-writer per cell
+
+    def _smooth(vals, half):
+        # Rolling mean over window = 2*half+1 cells (prefix sums, O(n))
+        m = len(vals)
+        pref = [0.0] * (m + 1)
+        for i in range(m):
+            pref[i + 1] = pref[i] + vals[i]
+        out = [0.0] * m
+        for i in range(m):
+            a = max(0, i - half)
+            b = min(m - 1, i + half)
+            out[i] = (pref[b + 1] - pref[a]) / (b - a + 1)
+        return out
+
+    short_half = max(2, int(target_secs * 0.30 / dt))   # local shape (~±10s)
+    long_half  = max(short_half * 3, int(180.0 / dt))   # ~3-min baseline
+    S = _smooth(grid, short_half)
+    B = _smooth(grid, long_half)
+    rel = [S[i] - B[i] for i in range(n)]
+    mean_r = sum(rel) / n
+    var_r = sum((r - mean_r) ** 2 for r in rel) / n
+    std_r = math.sqrt(var_r) if var_r > 0 else 0.0
+
+    # 2) Local maxima on the smoothed curve, ranked by relative prominence
+    peaks = []  # (index, prominence z, smoothed value)
+    for i in range(1, n - 1):
+        if S[i] >= S[i - 1] and S[i] >= S[i + 1] and (S[i] > S[i - 1] or S[i] > S[i + 1]):
+            z = (rel[i] - mean_r) / std_r if std_r > 0 else 0.0
+            peaks.append((i, z, S[i]))
+    if not peaks:
+        return []
+
+    # Prominence floor: keep moments that genuinely stand out from their own
+    # neighborhood (≥1.25σ above the ~3-min baseline, or ≥35% of the
+    # strongest peak). This is what separates a crowd-favorite song from
+    # ordinary curve noise on a loud concert heatmap.
+    z_max = max(p[1] for p in peaks)
+    z_min = max(1.25, 0.35 * z_max)
+    strong = [p for p in peaks if p[1] >= z_min]
+    if not strong:
+        strong = [max(peaks, key=lambda p: p[1])]
+
+    # Proximity suppression: one clip per standout moment — a wide spike
+    # produces several adjacent local maxima; keep only the strongest peak
+    # inside any target-window span.
+    sep_cells = max(1, int(target_secs / dt))
+    strong.sort(key=lambda p: p[1], reverse=True)
+    suppressed = []
+    for p in strong:
+        if any(abs(p[0] - q[0]) < sep_cells for q in suppressed):
+            continue
+        suppressed.append(p)
+    suppressed.sort(key=lambda p: p[0])  # back to chronological order
+
+    min_dur = max(6.0, target_secs * 0.45)
+
+    def _build_window(i, z):
+        c = start_bound + i * dt
+        s = max(start_bound, c - target_secs / 2.0)
+        e = min(end_bound, c + target_secs / 2.0)
+        if e - s < min_dur:
+            return None
+        heat = _heat_evidence(s, e, heatmap)
+        z_norm = min(1.0, max(0.0, z) / 3.0)
+        score = min(1.0, 0.5 * heat + 0.5 * z_norm)
+        return {"start": round(s, 2), "end": round(e, 2), "hook": round(c, 2),
+                "heat": heat, "z": z, "score": round(score, 4)}
+
+    scored = []
+    for i, z, _sv in suppressed:
+        w = _build_window(i, z)
+        if w:
+            scored.append(w)
+    if not scored:
+        return []
+
+    # 3) Greedy NMS: keep highest score, drop anything overlapping ≥45%
+    scored.sort(key=lambda w: w["score"], reverse=True)
+    picks = []
+    for w in scored:
+        if any(_overlaps(w["start"], w["end"], p["start"], p["end"]) for p in picks):
+            continue
+        picks.append(w)
+        if len(picks) >= count:
+            break
+    # Flat-ish heatmaps: relax overlap tolerance so we still surface some clips
+    if len(picks) < min(3, count):
+        picks = []
+        for w in scored:
+            if any(_overlaps(w["start"], w["end"], p["start"], p["end"], 0.85) for p in picks):
+                continue
+            picks.append(w)
+            if len(picks) >= count:
+                break
+
+    picks.sort(key=lambda w: w["score"], reverse=True)
+    return picks
+
+
 def annotate_and_extend_clips(
     clips: List[ViralClip],
     lines: List[dict],
@@ -1157,12 +1304,16 @@ async def analyze_video(request: AnalyzeRequest):
 
     async def stream():
         provider = (request.provider or "gemini").strip().lower()
+        # Normalize analysis mode: auto (default), podcast (text-first), concert (heatmap-only)
+        mode = (request.mode or "auto").strip().lower()
+        if mode not in ("auto", "podcast", "concert"):
+            mode = "auto"
         _prov_env = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
                      "anthropic": "ANTHROPIC_API_KEY", "openai-compatible": "OPENAI_API_KEY"}.get(provider, "GEMINI_API_KEY")
         gemini_key = (request.api_key or os.environ.get(_prov_env) or '').strip()
         is_mock = gemini_key.lower() == "mock"
 
-        if not gemini_key:
+        if not gemini_key and mode != "concert":
             yield _sse({"error": "AI API key is required. Add it under AI Settings (⚙️), or configure it on the server via env.", "status": 400})
             return
 
@@ -1287,61 +1438,108 @@ async def analyze_video(request: AnalyzeRequest):
                 yield _sse({"error": f"Failed to parse manual subtitles: {str(e)}", "status": 400})
                 return
         else:
-            yield _sse({
-                "step": 3,
-                "step_progress": 30,
-                "overall_progress": 55,
-                "stage": "Fetching Subtitles",
-                "detail": "Querying YouTube caption tracks & auto-generated transcripts...",
-                "message": "Fetching subtitles — trying video's original language..."
-            })
-            try:
-                transcript_lines = await asyncio.to_thread(fetch_transcript, video_id)
+            # ── Mode-aware transcript acquisition ─────────────────────────
+            #   concert: user asserts no useful speech — skip the fetch
+            #            entirely and mine the retention heatmap only.
+            #   auto:    try transcript; if none exists AND a heatmap is
+            #            available, fall back to the heatmap-only path
+            #            instead of erroring (concerts, instrumentals, ...).
+            #   podcast: transcript is the primary signal — required.
+            if mode == "concert" and not is_mock:
+                transcript_lines = []
+                logger.info("Concert mode — skipping transcript fetch (heatmap-only analysis).")
                 yield _sse({
                     "step": 3,
                     "step_progress": 100,
-                    "overall_progress": 70,
-                    "stage": "Subtitles Ready",
-                    "detail": f"Subtitles loaded — {len(transcript_lines)} dialogue sentences with timestamps ready.",
-                    "message": f"Subtitles loaded — {len(transcript_lines)} lines parsed successfully."
+                    "overall_progress": 60,
+                    "stage": "Subtitles Skipped",
+                    "detail": "Concert mode — no speech expected; analyzing viewer retention heatmap only.",
+                    "message": "Concert mode — skipping subtitles, using retention heatmap."
                 })
-            except Exception as e:
-                if is_mock:
-                    transcript_lines = [
-                        {"text": "Hello and welcome to this video.",            "start":  0.0, "duration": 3.0},
-                        {"text": "Today we are looking at how this app works.",  "start":  3.0, "duration": 4.0},
-                        {"text": "It finds viral hotspots and highlights them.",  "start":  7.0, "duration": 4.0},
-                        {"text": "Most people think it's magic.",               "start": 11.0, "duration": 3.0},
-                        {"text": "But it uses YouTube player heatmaps.",         "start": 14.0, "duration": 4.0},
-                        {"text": "And processes them with Gemini AI models.",    "start": 18.0, "duration": 4.0},
-                        {"text": "This is changing how editors crop videos.",    "start": 22.0, "duration": 5.0},
-                        {"text": "If you want to grow on TikTok, try it.",      "start": 27.0, "duration": 5.0},
-                        {"text": "We will explore the code next.",               "start": 32.0, "duration": 3.0},
-                    ]
+            else:
+                yield _sse({
+                    "step": 3,
+                    "step_progress": 30,
+                    "overall_progress": 55,
+                    "stage": "Fetching Subtitles",
+                    "detail": "Querying YouTube caption tracks & auto-generated transcripts...",
+                    "message": "Fetching subtitles — trying video's original language..."
+                })
+                try:
+                    transcript_lines = await asyncio.to_thread(fetch_transcript, video_id)
+                    if mode == "concert" and transcript_lines:
+                        # Auto-captions on music are usually "[Music]" noise —
+                        # ignore them in concert mode, they add no signal.
+                        logger.info(f"Concert mode — ignoring {len(transcript_lines)} auto-caption lines (noise).")
+                        transcript_lines = []
                     yield _sse({
                         "step": 3,
                         "step_progress": 100,
                         "overall_progress": 70,
                         "stage": "Subtitles Ready",
-                        "detail": "Mock mode — 9 sample dialogue lines loaded.",
-                        "message": "Mock mode — using sample transcript."
+                        "detail": f"Subtitles loaded — {len(transcript_lines)} dialogue sentences with timestamps ready.",
+                        "message": f"Subtitles loaded — {len(transcript_lines)} lines parsed successfully."
                     })
-                else:
-                    # Provide a helpful error message if the video is live or recently completed
-                    if is_live or live_status in ('is_live', 'is_upcoming', 'post_live'):
+                except Exception as e:
+                    if is_mock:
+                        transcript_lines = [
+                            {"text": "Hello and welcome to this video.",            "start":  0.0, "duration": 3.0},
+                            {"text": "Today we are looking at how this app works.",  "start":  3.0, "duration": 4.0},
+                            {"text": "It finds viral hotspots and highlights them.",  "start":  7.0, "duration": 4.0},
+                            {"text": "Most people think it's magic.",               "start": 11.0, "duration": 3.0},
+                            {"text": "But it uses YouTube player heatmaps.",         "start": 14.0, "duration": 4.0},
+                            {"text": "And processes them with Gemini AI models.",    "start": 18.0, "duration": 4.0},
+                            {"text": "This is changing how editors crop videos.",    "start": 22.0, "duration": 5.0},
+                            {"text": "If you want to grow on TikTok, try it.",      "start": 27.0, "duration": 5.0},
+                            {"text": "We will explore the code next.",               "start": 32.0, "duration": 3.0},
+                        ]
                         yield _sse({
-                            "error": (
-                                "No subtitles could be retrieved because this video is currently live, "
-                                "upcoming, or recently completed (post-live processing). Subtitles are only "
-                                "available once the live stream ends and YouTube finishes processing the video. "
-                                "You can upload custom subtitles manually to analyze this video."
-                            ),
-                            "status": 400
+                            "step": 3,
+                            "step_progress": 100,
+                            "overall_progress": 70,
+                            "stage": "Subtitles Ready",
+                            "detail": "Mock mode — 9 sample dialogue lines loaded.",
+                            "message": "Mock mode — using sample transcript."
+                        })
+                    elif mode == "auto" and heatmap:
+                        # No captions, but real viewer-retention telemetry exists
+                        # → continue on the heatmap-only (concert) path.
+                        transcript_lines = []
+                        logger.info("Auto mode — no transcript, heatmap present. Falling back to heatmap-only analysis.")
+                        yield _sse({
+                            "step": 3,
+                            "step_progress": 100,
+                            "overall_progress": 60,
+                            "stage": "Subtitles Unavailable",
+                            "detail": "No transcript found — falling back to viewer-retention heatmap analysis.",
+                            "message": "No subtitles — switching to retention-heatmap analysis."
                         })
                     else:
-                        msg = e.detail if isinstance(e, HTTPException) else str(e)
-                        yield _sse({"error": msg, "status": 400})
-                    return
+                        # Provide a helpful error message if the video is live or recently completed
+                        if is_live or live_status in ('is_live', 'is_upcoming', 'post_live'):
+                            yield _sse({
+                                "error": (
+                                    "No subtitles could be retrieved because this video is currently live, "
+                                    "upcoming, or recently completed (post-live processing). Subtitles are only "
+                                    "available once the live stream ends and YouTube finishes processing the video. "
+                                    "You can upload custom subtitles manually to analyze this video."
+                                ),
+                                "status": 400
+                            })
+                        else:
+                            msg = e.detail if isinstance(e, HTTPException) else str(e)
+                            if mode == "podcast":
+                                yield _sse({
+                                    "error": (
+                                        f"No transcript available for this video ({msg}). Podcast mode needs "
+                                        "spoken content — switch to Concert mode (retention heatmap only) or "
+                                        "upload custom subtitles/setlist manually."
+                                    ),
+                                    "status": 400
+                                })
+                            else:
+                                yield _sse({"error": msg, "status": 400})
+                        return
 
         # Estimate duration from transcript if missing
         if duration == 0.0 and transcript_lines:
@@ -1349,7 +1547,9 @@ async def analyze_video(request: AnalyzeRequest):
             duration = last.get("start", 0.0) + last.get("duration", 0.0)
 
 
-        # Slice transcript based on custom search range if provided
+        # Slice transcript based on custom search range if provided.
+        # (Heatmap-only runs — no transcript — still honor the bounds; the
+        # heatmap peak miner uses start_bound/end_bound below.)
         start_bound = 0.0
         end_bound = duration
         if request.range_start is not None or request.range_end is not None:
@@ -1365,20 +1565,21 @@ async def analyze_video(request: AnalyzeRequest):
                 yield _sse({"error": "Invalid search range: start time must be less than end time.", "status": 400})
                 return
 
-            filtered_lines = []
-            for line in transcript_lines:
-                ls = line.get("start", 0.0)
-                le = ls + line.get("duration", 0.0)
-                if max(ls, start_bound) < min(le, end_bound):
-                    filtered_lines.append(line)
-            
-            transcript_lines = filtered_lines
-            if not transcript_lines:
-                yield _sse({"error": f"No subtitles found in the specified range {start_bound}s to {end_bound}s.", "status": 400})
-                return
+            if transcript_lines:
+                filtered_lines = []
+                for line in transcript_lines:
+                    ls = line.get("start", 0.0)
+                    le = ls + line.get("duration", 0.0)
+                    if max(ls, start_bound) < min(le, end_bound):
+                        filtered_lines.append(line)
+                
+                transcript_lines = filtered_lines
+                if not transcript_lines:
+                    yield _sse({"error": f"No subtitles found in the specified range {start_bound}s to {end_bound}s.", "status": 400})
+                    return
             
             duration = end_bound - start_bound
-            logger.info(f"Filtered transcript to custom range: {start_bound}s to {end_bound}s (duration: {duration}s)")
+            logger.info(f"Filtered analysis to custom range: {start_bound}s to {end_bound}s (duration: {duration}s)")
 
         # Enrich transcript with heatmap engagement scores
         enriched_transcript = []
@@ -1470,6 +1671,96 @@ async def analyze_video(request: AnalyzeRequest):
             })
             return
 
+        # ── Heatmap-only path (concert mode / auto fallback) ─────────────
+        # No transcript lines survived, but viewer-retention telemetry is
+        # available: select clip windows algorithmically from heatmap peaks.
+        # No LLM call happens here — no API key required. (Cheap LLM titling
+        # of the top-K peaks is a separate enhancement on top of this path.)
+        if not transcript_lines and heatmap:
+            if duration <= 0:
+                yield _sse({"error": "Cannot analyze: no transcript and no video duration available.", "status": 400})
+                return
+            target_secs = {"15s": 18, "30s": 32, "60s": 60}.get(request.duration, 32)
+            if request.target_clip_count:
+                want = min(50, max(1, request.target_clip_count))
+            else:
+                want = min(20, max(8, int(duration / 240)))  # ~1 per 4 min, 8..20
+            yield _sse({
+                "step": 4,
+                "step_progress": 20,
+                "overall_progress": 78,
+                "stage": "Retention Peak Detection",
+                "detail": "Scanning viewer-retention curve for rewatch peaks against a local baseline...",
+                "message": "Heatmap-only mode — detecting retention peaks..."
+            })
+            windows = _heatmap_peaks(heatmap, duration, target_secs, want, start_bound, end_bound)
+            if not windows:
+                yield _sse({
+                    "error": "No clear retention peaks found — the audience curve is too flat to mine. "
+                             "Try Podcast mode (needs captions) or upload custom subtitles/setlist.",
+                    "status": 422
+                })
+                return
+            yield _sse({
+                "step": 4,
+                "step_progress": 75,
+                "overall_progress": 92,
+                "stage": "Selecting Top Rewinds",
+                "detail": f"{len(windows)} retention peaks found — building clip windows around the strongest...",
+                "message": f"Found {len(windows)} rewatch peaks — assembling clips."
+            })
+            heat_clips = []
+            for n_i, w in enumerate(windows, start=1):
+                heat_clips.append(ViralClip(
+                    title=f"Peak {n_i} — {_fmt_ts(w['hook'])}",
+                    start_time=w["start"],
+                    end_time=w["end"],
+                    hook_time=w["hook"],
+                    virality_score=max(1, min(98, int(round(w["score"] * 100)))),
+                    key_quotes=[],
+                    transcript="",
+                    title_suggestion="",
+                    caption_suggestion=(
+                        f"🔥 Most-rewatched moment at {_fmt_ts(w['hook'])} — "
+                        f"{title[:60]} #viral #highlights"
+                    ),
+                    hashtag_suggestion="#viral #shorts #highlights",
+                    signal="retention",
+                    heat_score=round(w["heat"], 3),
+                    text_score=0.0,
+                ))
+            heat_pts = [
+                HeatmapPoint(
+                    start_time=float(pt.get('start_time', 0.0)),
+                    end_time=float(pt.get('end_time', 0.0)),
+                    value=float(pt.get('value', 0.0))
+                )
+                for pt in heatmap
+            ]
+            summary = (f"Retention analysis of \"{title}\": {len(heat_clips)} most-rewatched moments "
+                       f"found from the viewer heatmap (no transcript needed). #viral #highlights")
+            heat_result = AnalyzeResponse(
+                video_id=video_id,
+                title=title,
+                duration=duration,
+                heatmap=heat_pts,
+                summary=summary,
+                clips=heat_clips,
+                transcript=None,
+                model="heatmap-peaks"
+            )
+            yield _sse({
+                "step": 4,
+                "step_progress": 100,
+                "overall_progress": 100,
+                "stage": "Analysis Complete",
+                "detail": f"Generated {len(heat_clips)} retention-peak clips from the heatmap.",
+                "done": True,
+                "result": heat_result.model_dump()
+            })
+            logger.info(f"Heatmap-only analysis complete — {len(heat_clips)} retention clips (mode={mode}).")
+            return
+
         is_long_video = duration > 3600
         if request.target_clip_count:
             N = request.target_clip_count
@@ -1547,6 +1838,11 @@ async def analyze_video(request: AnalyzeRequest):
         })
 
         # ── Step 4: AI call — Gemini (dynamic Flash fallback) or other provider ──
+        if not gemini_key and not is_mock:
+            # Reached the LLM stage without a key (concert mode + manual
+            # setlist subtitles, or auto mode where the transcript path won).
+            yield _sse({"error": "AI API key is required. Add it under AI Settings (⚙️), or configure it on the server via env.", "status": 400})
+            return
         models_to_try = [requested_model]
         if provider == "gemini":
             client = genai.Client(api_key=gemini_key)
