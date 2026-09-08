@@ -2336,15 +2336,27 @@ async def export_clip(request: ExportRequest):
     """Cuts a RAW clip from the source video — stream-copy, no re-encode, no
     crop, original resolution/quality — and serves it as a normal mp4 download.
 
+    Every export is padded with 2s of context BEFORE the requested start and
+    2s AFTER the requested end (clamped to 0 at the video start). The user's
+    editing phase (CapCut) does the precise frame-accurate trim, so the extra
+    headroom guarantees the hook moment is never cut off by keyframe
+    alignment (~1-2s). Stream-copy keeps the cut lossless and instant.
+
     CapCut exposes no public automation API, so the handoff is a plain file
-    download that the user imports into CapCut manually. Stream-copy keeps the
-    cut lossless and instant; accuracy is keyframe-aligned (~1-2s), acceptable
-    for a raw segment that gets trimmed in the editor anyway.
+    download that the user imports into CapCut manually.
     """
     if request.end_time <= request.start_time:
         raise HTTPException(status_code=400, detail="end_time must be greater than start_time.")
     if request.end_time - request.start_time > 3600:
         raise HTTPException(status_code=400, detail="Clip too long (max 60 minutes).")
+
+    # ── Context padding (±2s) for the editing-phase finish ───────────────
+    pad_pre = 2.0
+    pad_post = 2.0
+    cut_start = max(0.0, request.start_time - pad_pre)
+    cut_end = request.end_time + pad_post
+    logger.info(f"Export {request.video_id} requested {request.start_time:.1f}-{request.end_time:.1f}s "
+                f"→ padded cut {cut_start:.1f}-{cut_end:.1f}s (+{pad_pre:.0f}s/+{pad_post:.0f}s).")
 
     import shutil
     import subprocess
@@ -2356,7 +2368,7 @@ async def export_clip(request: ExportRequest):
     def _run() -> str:
         import yt_dlp  # lazy: heavy scraping package
         url = f"https://www.youtube.com/watch?v={request.video_id}"
-        dur = request.end_time - request.start_time
+        dur = cut_end - cut_start
         out_mp4 = os.path.join(tmpdir, "clip.mp4")
 
         # ── Export strategy note ──────────────────────────────────────────
@@ -2393,7 +2405,7 @@ async def export_clip(request: ExportRequest):
             raise ValueError("Could not download the source video.")
 
         cmd = [
-            "ffmpeg", "-y", "-ss", f"{request.start_time:.3f}", "-i", src,
+            "ffmpeg", "-y", "-ss", f"{cut_start:.3f}", "-i", src,
             "-t", f"{dur:.3f}", "-c", "copy", "-avoid_negative_ts", "make_zero",
             "-map", "0", out_mp4,
         ]
@@ -2401,7 +2413,7 @@ async def export_clip(request: ExportRequest):
         if proc.returncode != 0 or not os.path.exists(out_mp4) or os.path.getsize(out_mp4) == 0:
             # Frame-accurate fallback: re-encode the segment (slower, exact).
             cmd2 = [
-                "ffmpeg", "-y", "-ss", f"{request.start_time:.3f}", "-i", src,
+                "ffmpeg", "-y", "-ss", f"{cut_start:.3f}", "-i", src,
                 "-t", f"{dur:.3f}", "-c:v", "libx264", "-preset", "veryfast",
                 "-crf", "20", "-c:a", "aac", "-b:a", "128k", "-map", "0", out_mp4,
             ]
