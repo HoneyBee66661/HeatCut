@@ -364,6 +364,36 @@ def fetch_video_metadata(url: str):
             logger.warning(f"yt-dlp metadata extraction failed (proxy={'yes' if attempt_proxy else 'no'}): {e}")
             continue
 
+    # Bot-check fallback: the web client sometimes trips YouTube's
+    # "Sign in to confirm you're not a bot" on popular/live content —
+    # retry once with the tv/android player client (no login needed)
+    # before giving up to Supadata.
+    try:
+        bot_opts: Any = {
+            'skip_download': True,
+            'youtube_include_dash_manifest': False,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            'socket_timeout': 10,
+            'extractor_args': {'youtube': ['player_client=tv,android']},
+        }
+        cf = get_yt_cookiefile()
+        if cf:
+            bot_opts['cookiefile'] = cf
+        with yt_dlp.YoutubeDL(bot_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                return {
+                    "title": info.get('title') or 'Unknown YouTube Video',
+                    "duration": float(info.get('duration') or 0.0),
+                    "heatmap": info.get('heatmap') or [],
+                    "is_live": bool(info.get('is_live') or False),
+                    "live_status": info.get('live_status') or 'not_live'
+                }
+    except Exception as e:
+        logger.warning(f"yt-dlp bot-check fallback (tv/android client) failed: {e}")
+
     # Serverless-friendly fallback: Supadata unified metadata (title + duration only —
     # Supadata has NO retention-heatmap endpoint, so heatmap stays empty on this path).
     # Keeps the API functional on Vercel/datacenter IPs where yt-dlp is blocked.
@@ -2429,8 +2459,24 @@ async def export_clip(request: ExportRequest):
         cf = get_yt_cookiefile()
         if cf:
             dl_opts["cookiefile"] = cf
-        with yt_dlp.YoutubeDL(dl_opts) as ydl:
-            ydl.download([url])
+
+        def _do_download(opts: Any) -> None:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+        try:
+            _do_download(dl_opts)
+        except Exception as e:
+            if _botcheck_message(e):
+                # Bot-check on the default web client — retry once with the
+                # tv/android player client (often exempt, no login needed).
+                logger.warning("Export hit YouTube bot-check — retrying with tv/android player client.")
+                _do_download({
+                    **dl_opts,
+                    "extractor_args": {"youtube": ["player_client=tv,android"]},
+                })
+            else:
+                raise
         src = None
         for f in sorted(os.listdir(tmpdir)):
             if f.startswith("src."):
