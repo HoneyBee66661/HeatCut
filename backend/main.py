@@ -24,7 +24,7 @@ import math
 import logging
 import asyncio
 import json
-from typing import List, Optional
+from typing import List, Optional, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1709,22 +1709,100 @@ async def analyze_video(request: AnalyzeRequest):
                 "detail": f"{len(windows)} retention peaks found — building clip windows around the strongest...",
                 "message": f"Found {len(windows)} rewatch peaks — assembling clips."
             })
+
+            # ── Optional LLM pass: catchy titles/captions for the peaks ──
+            # The heatmap path works fully keyless; when a key IS present, ask
+            # the model only to write copy for the windows we already picked
+            # (tiny prompt, no transcript). Any failure keeps algorithmic titles.
+            titles_by_start = {}
+            titled_model = None
+            if gemini_key and not is_mock:
+                yield _sse({
+                    "step": 4,
+                    "step_progress": 85,
+                    "overall_progress": 95,
+                    "stage": "Titling Peaks",
+                    "detail": f"Drafting viral titles/captions for {len(windows)} retention peaks...",
+                    "message": "Polishing titles & captions for the top rewatch moments..."
+                })
+                try:
+                    req_model = (request.model or 'gemini-2.5-flash').strip()
+                    win_desc = "\n".join(
+                        f"{w['start']:.0f}|{w['end']:.0f}|{w['hook']:.0f}|{w['score']:.2f}"
+                        for w in windows
+                    )
+                    title_prompt = (
+                        "You are a viral-clip titling assistant. Below are the most-rewatched moments "
+                        f"from a video with NO transcript (concert/live music/music video):\n"
+                        f"Video title: {title}\n"
+                        "Columns: start|end|hook|rewatch_score(0-1)\n"
+                        f"---\n{win_desc}\n---\n"
+                        "For EVERY moment return: a catchy short title (max 8 words, emoji ok), a punchy "
+                        "alternative title suggestion, an engaging short caption for TikTok/Reels/Shorts "
+                        "that mentions the hook timestamp, and 3-5 lowercase hashtags. If the video title "
+                        "language is obvious, match it; otherwise use English.\n"
+                        'Return ONLY JSON: {"clips": [{"start_time": float, "title": "...", '
+                        '"title_suggestion": "...", "caption_suggestion": "...", "hashtag_suggestion": "..."}]}'
+                    )
+                    if provider == "gemini":
+                        _gclient = genai.Client(api_key=gemini_key)
+
+                        def _gemini_title_call():
+                            _resp = _gclient.models.generate_content(
+                                model=req_model,
+                                contents=title_prompt,
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    temperature=0.2,
+                                )
+                            )
+                            return _resp.text or ""
+
+                        raw_title = await asyncio.wait_for(
+                            asyncio.to_thread(_gemini_title_call), timeout=60)
+                    else:
+                        raw_title = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _provider_llm_call, provider, req_model, title_prompt,
+                                request.api_key or gemini_key, request.base_url or None,
+                            ),
+                            timeout=60,
+                        )
+                    parsed_title = _parse_json_response(raw_title) or {}
+                    for item in parsed_title.get("clips", []):
+                        try:
+                            st = round(float(item.get("start_time", -1)), 1)
+                        except (TypeError, ValueError):
+                            continue
+                        if st >= 0 and isinstance(item, dict):
+                            titles_by_start[st] = item
+                    if titles_by_start:
+                        titled_model = req_model
+                        logger.info(f"Heatmap titling applied to {len(titles_by_start)}/{len(windows)} peaks via {req_model}.")
+                except Exception as e:
+                    logger.info(f"Heatmap titling skipped ({str(e)[:120]}) — keeping algorithmic titles.")
+
             heat_clips = []
             for n_i, w in enumerate(windows, start=1):
+                meta = titles_by_start.get(round(w["start"], 1)) or {}
+                clip_title = (meta.get("title") or "").strip() or f"Peak {n_i} — {_fmt_ts(w['hook'])}"
+                clip_title_sug = (meta.get("title_suggestion") or "").strip()
+                clip_caption = (meta.get("caption_suggestion") or "").strip() or (
+                    f"🔥 Most-rewatched moment at {_fmt_ts(w['hook'])} — "
+                    f"{title[:60]} #viral #highlights"
+                )
+                clip_hashtags = (meta.get("hashtag_suggestion") or "").strip() or "#viral #shorts #highlights"
                 heat_clips.append(ViralClip(
-                    title=f"Peak {n_i} — {_fmt_ts(w['hook'])}",
+                    title=clip_title,
                     start_time=w["start"],
                     end_time=w["end"],
                     hook_time=w["hook"],
                     virality_score=max(1, min(98, int(round(w["score"] * 100)))),
                     key_quotes=[],
                     transcript="",
-                    title_suggestion="",
-                    caption_suggestion=(
-                        f"🔥 Most-rewatched moment at {_fmt_ts(w['hook'])} — "
-                        f"{title[:60]} #viral #highlights"
-                    ),
-                    hashtag_suggestion="#viral #shorts #highlights",
+                    title_suggestion=clip_title_sug,
+                    caption_suggestion=lowercase_hashtags_in_string(clip_caption),
+                    hashtag_suggestion=lowercase_hashtags_in_string(clip_hashtags),
                     signal="retention",
                     heat_score=round(w["heat"], 3),
                     text_score=0.0,
@@ -1747,7 +1825,7 @@ async def analyze_video(request: AnalyzeRequest):
                 summary=summary,
                 clips=heat_clips,
                 transcript=None,
-                model="heatmap-peaks"
+                model=titled_model or "heatmap-peaks"
             )
             yield _sse({
                 "step": 4,
@@ -1785,8 +1863,19 @@ async def analyze_video(request: AnalyzeRequest):
 
         MAX_LINES = 2500 if is_long_video else 800
         if len(transcript_dump) > MAX_LINES:
-            logger.warning(f"Transcript {len(transcript_dump)} lines — truncating to {MAX_LINES}.")
-            transcript_dump = transcript_dump[:MAX_LINES]
+            # Head-truncation silently dropped the tail of long videos (a 3h
+            # source exceeds 2500 caption lines), so moments in the last hour
+            # were never visible to the LLM. Keep the intro (context) plus an
+            # even sample across the whole timeline instead.
+            total = len(transcript_dump)
+            keep_head = min(int(MAX_LINES * 0.15), 200)
+            budget = MAX_LINES - keep_head
+            rest = transcript_dump[keep_head:]
+            step = len(rest) / budget
+            sampled = [rest[int(i * step)] for i in range(budget)]
+            transcript_dump = transcript_dump[:keep_head] + sampled
+            logger.warning(f"Transcript {total} lines — keeping {keep_head} intro + even sample of {budget} across whole timeline.")
+            del total, keep_head, budget, rest, step, sampled
 
         transcript_text = "\n".join(transcript_dump)
         dur_range   = {"15s": "10-20s", "30s": "20-40s", "60s": "45-75s"}.get(request.duration, "20-40s")
@@ -2267,18 +2356,77 @@ async def export_clip(request: ExportRequest):
     def _run() -> str:
         import yt_dlp  # lazy: heavy scraping package
         url = f"https://www.youtube.com/watch?v={request.video_id}"
-        outtmpl = os.path.join(tmpdir, "src.%(ext)s")
-        ydl_opts = {
+        dur = request.end_time - request.start_time
+        out_mp4 = os.path.join(tmpdir, "clip.mp4")
+
+        # ── Fast path: ranged download of a muxed (progressive) format ────
+        # When YouTube still serves a single-file format (video+audio in one
+        # container over plain HTTPS), ffmpeg can seek into the remote file
+        # via HTTP Range and fetch ONLY the requested window — a 45s clip
+        # from a 3-hour source transfers ~45s of media. Note: yt-dlp's own
+        # --download-sections proved unreliable on yt-dlp 2026.08 (verified:
+        # it silently downloads the FULL DASH/HLS stream and never cuts), so
+        # section mining is NOT used here. Many popular videos no longer have
+        # progressive formats (YouTube is phasing them out) — when absent,
+        # this fast path skips straight to the legacy full download below.
+        try:
+            with yt_dlp.YoutubeDL({
+                "quiet": True, "no_warnings": True, "noprogress": True,
+                "socket_timeout": 15, "retries": 2,
+            }) as ydl_probe:
+                info = ydl_probe.extract_info(url, download=False)
+            formats = (info or {}).get("formats") or []
+            prog = None
+            best_h = -1
+            for f in formats:
+                if (f.get("vcodec") not in (None, "none")
+                        and f.get("acodec") not in (None, "none")
+                        and f.get("protocol") == "https" and f.get("url")
+                        and (f.get("height") or 0) > best_h):
+                    prog = f
+                    best_h = f.get("height") or 0
+            if prog:
+                ranged = [
+                    "ffmpeg", "-y", "-ss", f"{request.start_time:.3f}", "-i", prog["url"],
+                    "-t", f"{dur:.3f}", "-c", "copy", "-avoid_negative_ts", "make_zero",
+                    "-map", "0", out_mp4,
+                ]
+                proc = subprocess.run(ranged, capture_output=True, text=True, timeout=900)
+                if proc.returncode == 0 and os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "csv=p=0", out_mp4],
+                        capture_output=True, text=True, timeout=60)
+                    try:
+                        out_dur = float(probe.stdout.strip())
+                    except ValueError:
+                        out_dur = 0.0
+                    if out_dur > 0 and abs(out_dur - dur) <= max(6.0, dur * 0.15):
+                        logger.info(f"Ranged progressive export OK — {out_dur:.1f}s via ffmpeg HTTP Range.")
+                        return out_mp4
+                raise ValueError("ranged progressive download produced no valid clip")
+            logger.info("No progressive format available — using full DASH download.")
+        except Exception as e:
+            logger.warning(f"Ranged export skipped ({str(e)[:120]}) — using full download.")
+            for f in os.listdir(tmpdir):
+                try:
+                    os.remove(os.path.join(tmpdir, f))
+                except OSError:
+                    pass
+
+        # ── Legacy path: full download + local stream-copy cut ────────────
+        src_outtmpl = os.path.join(tmpdir, "src.%(ext)s")
+        legacy_opts: Any = {
             "format": "bv*[height<=?1080]+ba/b[height<=?1080]/b",
             "merge_output_format": "mp4",
-            "outtmpl": outtmpl,
+            "outtmpl": src_outtmpl,
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
             "socket_timeout": 15,
             "retries": 3,
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(legacy_opts) as ydl:
             ydl.download([url])
         src = None
         for f in sorted(os.listdir(tmpdir)):
@@ -2288,8 +2436,6 @@ async def export_clip(request: ExportRequest):
         if not src:
             raise ValueError("Could not download the source video.")
 
-        out_mp4 = os.path.join(tmpdir, "clip.mp4")
-        dur = request.end_time - request.start_time
         cmd = [
             "ffmpeg", "-y", "-ss", f"{request.start_time:.3f}", "-i", src,
             "-t", f"{dur:.3f}", "-c", "copy", "-avoid_negative_ts", "make_zero",
