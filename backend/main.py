@@ -24,7 +24,7 @@ import math
 import logging
 import asyncio
 import json
-from typing import List, Optional, Any
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -2359,74 +2359,30 @@ async def export_clip(request: ExportRequest):
         dur = request.end_time - request.start_time
         out_mp4 = os.path.join(tmpdir, "clip.mp4")
 
-        # ── Fast path: ranged download of a muxed (progressive) format ────
-        # When YouTube still serves a single-file format (video+audio in one
-        # container over plain HTTPS), ffmpeg can seek into the remote file
-        # via HTTP Range and fetch ONLY the requested window — a 45s clip
-        # from a 3-hour source transfers ~45s of media. Note: yt-dlp's own
-        # --download-sections proved unreliable on yt-dlp 2026.08 (verified:
-        # it silently downloads the FULL DASH/HLS stream and never cuts), so
-        # section mining is NOT used here. Many popular videos no longer have
-        # progressive formats (YouTube is phasing them out) — when absent,
-        # this fast path skips straight to the legacy full download below.
-        try:
-            with yt_dlp.YoutubeDL({
-                "quiet": True, "no_warnings": True, "noprogress": True,
-                "socket_timeout": 15, "retries": 2,
-            }) as ydl_probe:
-                info = ydl_probe.extract_info(url, download=False)
-            formats = (info or {}).get("formats") or []
-            prog = None
-            best_h = -1
-            for f in formats:
-                if (f.get("vcodec") not in (None, "none")
-                        and f.get("acodec") not in (None, "none")
-                        and f.get("protocol") == "https" and f.get("url")
-                        and (f.get("height") or 0) > best_h):
-                    prog = f
-                    best_h = f.get("height") or 0
-            if prog:
-                ranged = [
-                    "ffmpeg", "-y", "-ss", f"{request.start_time:.3f}", "-i", prog["url"],
-                    "-t", f"{dur:.3f}", "-c", "copy", "-avoid_negative_ts", "make_zero",
-                    "-map", "0", out_mp4,
-                ]
-                proc = subprocess.run(ranged, capture_output=True, text=True, timeout=900)
-                if proc.returncode == 0 and os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
-                    probe = subprocess.run(
-                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                         "-of", "csv=p=0", out_mp4],
-                        capture_output=True, text=True, timeout=60)
-                    try:
-                        out_dur = float(probe.stdout.strip())
-                    except ValueError:
-                        out_dur = 0.0
-                    if out_dur > 0 and abs(out_dur - dur) <= max(6.0, dur * 0.15):
-                        logger.info(f"Ranged progressive export OK — {out_dur:.1f}s via ffmpeg HTTP Range.")
-                        return out_mp4
-                raise ValueError("ranged progressive download produced no valid clip")
-            logger.info("No progressive format available — using full DASH download.")
-        except Exception as e:
-            logger.warning(f"Ranged export skipped ({str(e)[:120]}) — using full download.")
-            for f in os.listdir(tmpdir):
-                try:
-                    os.remove(os.path.join(tmpdir, f))
-                except OSError:
-                    pass
-
-        # ── Legacy path: full download + local stream-copy cut ────────────
-        src_outtmpl = os.path.join(tmpdir, "src.%(ext)s")
-        legacy_opts: Any = {
+        # ── Export strategy note ──────────────────────────────────────────
+        # TRUE partial download (fetch only the clip window of a 1h source)
+        # is NOT possible through yt-dlp today, verified on 2026.08:
+        #   - `download_sections` silently downloads the FULL DASH/HLS stream
+        #     and never cuts (section output == full video duration).
+        #   - YouTube no longer serves muxed/progressive single-file formats
+        #     (checked 2026-09: 0 muxed formats across multiple videos incl.
+        #     old uploads) — so an ffmpeg HTTP-Range seek has no target URL.
+        # All YouTube streams are video-only + audio-only DASH fragments.
+        # Real partial transfer therefore needs a custom fragment-range
+        # miner (select fragments overlapping the window per stream, concat
+        # with the init segment, then mux) — tracked as future work. Until
+        # then the export below is the reliable full-download + stream-copy
+        # cut (correct, heavy for long sources).
+        with yt_dlp.YoutubeDL({
             "format": "bv*[height<=?1080]+ba/b[height<=?1080]/b",
             "merge_output_format": "mp4",
-            "outtmpl": src_outtmpl,
+            "outtmpl": os.path.join(tmpdir, "src.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
             "socket_timeout": 15,
             "retries": 3,
-        }
-        with yt_dlp.YoutubeDL(legacy_opts) as ydl:
+        }) as ydl:
             ydl.download([url])
         src = None
         for f in sorted(os.listdir(tmpdir)):
