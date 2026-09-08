@@ -24,7 +24,7 @@ import math
 import logging
 import asyncio
 import json
-from typing import List, Optional
+from typing import List, Optional, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -298,6 +298,34 @@ def get_proxy_url() -> Optional[str]:
     proxy = os.environ.get("PROXY_URL") or os.environ.get("WEBSHARE_PROXY") or ""
     return proxy.strip() or None
 
+
+def get_yt_cookiefile() -> Optional[str]:
+    """Path to a Netscape-format yt-dlp cookies file, or None if absent.
+
+    Override with env YT_COOKIES_FILE; default `<backend>/yt_cookies.txt`.
+    YouTube bot-checks non-residential IPs on popular/live content
+    ("Sign in to confirm you're not a bot") — a cookies export from a
+    logged-in browser fixes it. The file is gitignored; treat as a secret.
+    """
+    p = os.environ.get("YT_COOKIES_FILE") or os.path.join(_base_dir, "yt_cookies.txt")
+    return p if os.path.exists(p) and os.path.getsize(p) > 0 else None
+
+
+def _botcheck_message(e: Exception) -> Optional[str]:
+    """Maps a yt-dlp bot-check error to a friendly remediation string."""
+    s = str(e)
+    low = s.lower()
+    if "sign in to confirm" in low or ("bot" in low and "cookies" in low):
+        return (
+            "YouTube blocked this download as a bot check on the server's IP "
+            "(common for popular/live videos). Fix: export a cookies.txt from a "
+            "browser logged into YouTube and place it at backend/yt_cookies.txt "
+            "(or set YT_COOKIES_FILE). See the app's README/help for the exact "
+            "export steps, then retry this clip."
+        )
+    return None
+
+
 def fetch_video_metadata(url: str):
     """Fetches video title, duration, and viewer retention heatmap using yt-dlp."""
     import yt_dlp  # lazy: heavy, only needed for direct scraping
@@ -308,7 +336,7 @@ def fetch_video_metadata(url: str):
     attempts = [proxy, None] if (is_vercel and proxy) else [None, proxy] if proxy else [None]
     
     for attempt_proxy in attempts:
-        ydl_opts = {
+        ydl_opts: Any = {
             'skip_download': True,
             'youtube_include_dash_manifest': False,
             'quiet': True,
@@ -317,6 +345,9 @@ def fetch_video_metadata(url: str):
             'proxy': attempt_proxy,
             'socket_timeout': 10
         }
+        cf = get_yt_cookiefile()
+        if cf:
+            ydl_opts['cookiefile'] = cf
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -2385,7 +2416,7 @@ async def export_clip(request: ExportRequest):
         # with the init segment, then mux) — tracked as future work. Until
         # then the export below is the reliable full-download + stream-copy
         # cut (correct, heavy for long sources).
-        with yt_dlp.YoutubeDL({
+        dl_opts: Any = {
             "format": "bv*[height<=?1080]+ba/b[height<=?1080]/b",
             "merge_output_format": "mp4",
             "outtmpl": os.path.join(tmpdir, "src.%(ext)s"),
@@ -2394,7 +2425,11 @@ async def export_clip(request: ExportRequest):
             "noprogress": True,
             "socket_timeout": 15,
             "retries": 3,
-        }) as ydl:
+        }
+        cf = get_yt_cookiefile()
+        if cf:
+            dl_opts["cookiefile"] = cf
+        with yt_dlp.YoutubeDL(dl_opts) as ydl:
             ydl.download([url])
         src = None
         for f in sorted(os.listdir(tmpdir)):
@@ -2427,7 +2462,8 @@ async def export_clip(request: ExportRequest):
         out_mp4 = await asyncio.to_thread(_run)
     except Exception as e:  # noqa: BLE001 — surface a clean API error to the client
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
+        friendly = _botcheck_message(e)
+        raise HTTPException(status_code=500, detail=f"Export failed: {friendly or e}")
 
     base = (request.title or "").strip() or f"clip-{request.video_id}"
     slug = re.sub(r"[^A-Za-z0-9]+", "-", base).strip("-").lower()[:60] or f"clip-{request.video_id}"
