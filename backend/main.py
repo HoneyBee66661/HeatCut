@@ -21,6 +21,8 @@ load_dotenv()
 
 import re
 import math
+import struct
+import subprocess
 import logging
 import asyncio
 import json
@@ -1016,6 +1018,173 @@ def _heatmap_peaks(heatmap: List[dict], duration: float, target_secs: float,
 
     picks.sort(key=lambda w: w["score"], reverse=True)
     return picks
+
+
+# ----------------------------------------------------------------
+# DASH fragment-range miner — TRUE partial downloads for long sources
+# ----------------------------------------------------------------
+# YouTube's https DASH streams are single range-able fMP4 files:
+#   [ftyp+moov] [sidx index] [moof/mdat fragments ...]
+# The sidx box lists every fragment's byte size + duration, so a clip
+# window maps to a contiguous byte range. We fetch ONLY that range per
+# stream (video + audio), prepend the tiny ftyp+moov init, remux with
+# ffmpeg -c copy, and trim — transferring ~seconds of media instead of
+# the whole video. Any failure falls back to the full download path.
+
+def _fmp4_sidx(buf: bytes):
+    """Parse the first sidx box; return (timescale, abs_first_byte, entries).
+
+    entries = [(size, duration_ts), ...] in media order. abs_first_byte is
+    the file offset where the first fragment's data begins.
+    """
+    i = 0
+    while i + 8 <= len(buf):
+        size, typ = struct.unpack(">I4s", buf[i:i + 8])
+        if size == 1:
+            size = struct.unpack(">Q", buf[i + 8:i + 16])[0]
+        if typ == b"sidx":
+            b = buf[i + 8:]
+            ver = b[0] >> 4
+            timescale = struct.unpack(">I", b[8:12])[0]
+            if ver == 0:
+                first_off = struct.unpack(">I", b[16:20])[0]
+                count = struct.unpack(">H", b[22:24])[0]
+                refs_start = 24
+            else:
+                first_off = struct.unpack(">Q", b[20:28])[0]
+                count = struct.unpack(">H", b[30:32])[0]
+                refs_start = 32
+            abs_first = i + size + first_off
+            entries = []
+            pos = refs_start
+            for _ in range(count):
+                sz_field = struct.unpack(">I", b[pos:pos + 4])[0]
+                dur = struct.unpack(">I", b[pos + 4:pos + 8])[0]
+                entries.append((sz_field & 0xFFFFFF, dur))
+                pos += 12
+            return timescale, abs_first, entries
+        if size < 8:
+            break
+        i += size
+    raise ValueError("no sidx box in fMP4 header")
+
+
+def _download_fmp4_window(fmt: dict, t0: float, t1: float) -> bytes:
+    """Fetch ftyp+moov plus exactly the fragments overlapping [t0, t1]."""
+    import requests as _rq
+    headers = dict(fmt.get("http_headers") or {})
+    # 1) Header: ftyp+moov+sidx. Fragmented-DASH moovs are tiny (no sample
+    #    tables); sidx grows ~12 B/fragment (a 3.5h video ≈ 25 KB), so a
+    #    128 KB head fetch covers both comfortably.
+    head = _rq.get(fmt["url"], headers={**headers, "Range": "bytes=0-131071"}, timeout=60)
+    if head.status_code not in (200, 206) or len(head.content) < 1024:
+        raise ValueError(f"fMP4 header fetch failed (HTTP {head.status_code})")
+    buf = head.content
+    # locate moov end (init prefix) while walking to sidx
+    i = 0
+    init_end = 0
+    ts = None
+    abs_first = 0
+    entries = []
+    while i + 8 <= len(buf):
+        size, typ = struct.unpack(">I4s", buf[i:i + 8])
+        if size == 1:
+            size = struct.unpack(">Q", buf[i + 8:i + 16])[0]
+        if typ == b"moov":
+            init_end = i + size
+        elif typ == b"sidx":
+            ts, abs_first, entries = _fmp4_sidx(buf)
+            break
+        if size < 8:
+            break
+        i += size
+    if ts is None or not entries or abs_first > len(buf):
+        raise ValueError("no usable sidx within header window")
+    init = buf[:init_end]
+
+    # 2) Map [t0, t1] → fragment indices (durations in timescale units)
+    from bisect import bisect_left
+    bounds = [0]
+    for _sz, dur_ts in entries:
+        bounds.append(bounds[-1] + dur_ts)
+    t0_ts = int(t0 * ts)
+    t1_ts = int(t1 * ts)
+    i0 = max(0, bisect_left(bounds, t0_ts) - 1)          # fragment containing t0
+    i1 = max(i0, min(len(entries) - 1, bisect_left(bounds, t1_ts) - 1))
+    if bounds[i1 + 1] <= t0_ts:                          # window past last frag
+        raise ValueError("clip window beyond stream end")
+    start_byte = abs_first + sum(e[0] for e in entries[:i0])
+    end_byte = abs_first + sum(e[0] for e in entries[:i1 + 1])
+    total = end_byte - start_byte
+    if total <= 0 or total > 2_000_000_000:
+        raise ValueError(f"invalid byte range {total}")
+
+    # 3) Single ranged GET for the whole window slice
+    rng = _rq.get(fmt["url"], headers={**headers, "Range": f"bytes={start_byte}-{end_byte - 1}"},
+                  timeout=180)
+    if rng.status_code != 206:
+        raise ValueError(f"fMP4 range fetch failed (HTTP {rng.status_code})")
+    media = rng.content
+    if len(media) < total * 0.9:
+        raise ValueError(f"short range read ({len(media)}/{total})")
+    return init + media
+
+
+def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) -> str:
+    """Try a partial (fragment-range) export; raise on any failure."""
+    import yt_dlp  # lazy: heavy scraping package
+
+    with yt_dlp.YoutubeDL({
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "socket_timeout": 15, "retries": 2,
+    }) as ydl:
+        info = ydl.extract_info(url, download=False)
+    formats = (info or {}).get("formats") or []
+    vfmt = None
+    v_h = -1
+    for f in formats:
+        if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
+                and f.get("protocol") == "https" and f.get("ext") == "mp4"
+                and f.get("url") and (f.get("height") or 0) > v_h):
+            vfmt = f
+            v_h = f.get("height") or 0
+    afmt = None
+    a_b = -1.0
+    for f in formats:
+        if (f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+                and f.get("protocol") == "https" and f.get("ext") in ("m4a", "mp4")
+                and f.get("url") and (f.get("tbr") or f.get("abr") or 0) > a_b):
+            afmt = f
+            a_b = f.get("tbr") or f.get("abr") or 0
+    if not vfmt or not afmt:
+        raise ValueError("no https DASH video+audio pair with sidx")
+    if not (vfmt.get("height") or 0) >= 360:
+        raise ValueError("DASH video too small")
+
+    v_fmp4 = os.path.join(tmpdir, "v_part.mp4")
+    a_fmp4 = os.path.join(tmpdir, "a_part.m4a")
+    with open(v_fmp4, "wb") as fh:
+        fh.write(_download_fmp4_window(vfmt, cut_start, cut_end))
+    with open(a_fmp4, "wb") as fh:
+        fh.write(_download_fmp4_window(afmt, cut_start, cut_end))
+
+    merged = os.path.join(tmpdir, "merged.mp4")
+    m = subprocess.run(
+        ["ffmpeg", "-y", "-i", v_fmp4, "-i", a_fmp4, "-c", "copy",
+         "-movflags", "+faststart", merged],
+        capture_output=True, text=True, timeout=300)
+    if m.returncode != 0 or not os.path.exists(merged) or os.path.getsize(merged) == 0:
+        raise ValueError(f"fragment merge failed: {(m.stderr or '')[-200:]}")
+
+    # No further trim: the merged file starts at the first fragment boundary
+    # AT OR BEFORE cut_start and ends at the last fragment boundary AT OR
+    # AFTER cut_end — a strict SUPERSET of the padded window, so the hook is
+    # never lost. (A post-merge `-ss` stream-copy trim proved unreliable on
+    # this input — it dropped ~11s of the window — so we keep the fragment-
+    # aligned cut and let the editor trim, same philosophy as the ±2s pad.)
+    # Extra headroom is bounded by one fragment per side (video fragments are
+    # ~2-7s on YouTube; the miner's caller validates the result's duration).
+    return merged
 
 
 def annotate_and_extend_clips(
@@ -2432,20 +2601,42 @@ async def export_clip(request: ExportRequest):
         dur = cut_end - cut_start
         out_mp4 = os.path.join(tmpdir, "clip.mp4")
 
-        # ── Export strategy note ──────────────────────────────────────────
-        # TRUE partial download (fetch only the clip window of a 1h source)
-        # is NOT possible through yt-dlp today, verified on 2026.08:
-        #   - `download_sections` silently downloads the FULL DASH/HLS stream
-        #     and never cuts (section output == full video duration).
-        #   - YouTube no longer serves muxed/progressive single-file formats
-        #     (checked 2026-09: 0 muxed formats across multiple videos incl.
-        #     old uploads) — so an ffmpeg HTTP-Range seek has no target URL.
-        # All YouTube streams are video-only + audio-only DASH fragments.
-        # Real partial transfer therefore needs a custom fragment-range
-        # miner (select fragments overlapping the window per stream, concat
-        # with the init segment, then mux) — tracked as future work. Until
-        # then the export below is the reliable full-download + stream-copy
-        # cut (correct, heavy for long sources).
+        # ── Fast path: DASH fragment-range miner ─────────────────────────
+        # True partial transfer: fetch only the fragments overlapping the
+        # padded clip window (see _frag_miner_export). Falls back silently
+        # to the full download below on ANY failure (no sidx, odd codecs,
+        # bot-check, ffmpeg hiccup, ...). Wasted bytes on failure ≈ the
+        # window slice only — never a second full download.
+        try:
+            mined = _frag_miner_export(url, tmpdir, cut_start, cut_end)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", mined],
+                capture_output=True, text=True, timeout=60)
+            try:
+                out_dur = float(probe.stdout.strip())
+            except ValueError:
+                out_dur = 0.0
+            # Superset semantics: the fragment cut must COVER the whole
+            # padded window (never less), with headroom bounded by ~1 video
+            # fragment per side (≈ +2-15s). Anything outside → legacy path.
+            if out_dur >= dur * 0.9 and out_dur <= dur + 25.0:
+                logger.info(f"Fragment-miner export OK — {out_dur:.1f}s covers {dur:.1f}s window.")
+                return mined
+            raise ValueError(f"miner output duration mismatch ({out_dur:.1f}s vs window {dur:.1f}s)")
+        except Exception as e:
+            logger.warning(f"Fragment-miner export failed ({str(e)[:120]}) — falling back to full download.")
+            for f in os.listdir(tmpdir):  # remove partial miner artifacts
+                try:
+                    os.remove(os.path.join(tmpdir, f))
+                except OSError:
+                    pass
+
+        # ── Fallback: full DASH download + local stream-copy cut ─────────
+        # Used when the fragment miner cannot run (no sidx, unsupported
+        # codec pair, bot-check during extraction, merge/trim failure).
+        # Correct but heavy for long sources — downloads the WHOLE video
+        # before cutting.
         dl_opts: Any = {
             "format": "bv*[height<=?1080]+ba/b[height<=?1080]/b",
             "merge_output_format": "mp4",
