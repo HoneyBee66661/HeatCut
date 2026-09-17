@@ -1065,7 +1065,14 @@ Transcript:
     if (!result || exportingClipKey) return;
     const key = `${result.video_id}-${clip.start_time}-${clip.end_time}`;
     setExportingClipKey(key);
-    setToastMessage(t.results.preparingDownload);
+    // Download name: heatcut_<video title>.mp4 (sanitized)
+    const safeTitle =
+      (result.title || `video-${result.video_id}`)
+        .replace(/[^\p{L}\p{N} _.-]+/gu, '')
+        .replace(/[\s_]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 80) || 'clip';
+    const filename = `heatcut_${safeTitle}.mp4`;
     try {
       // Prefer the DEVICE WORKER for downloads: on cloud deploys (Vercel)
       // the server cannot scrape YouTube (datacenter IPs are bot-blocked),
@@ -1081,7 +1088,6 @@ Transcript:
       }
 
       let blob: Blob;
-      let filename: string;
       if (workerOnline) {
         const qs = new URLSearchParams({
           video_id: result.video_id,
@@ -1095,7 +1101,6 @@ Transcript:
           throw new Error(detail?.detail || t.results.exportFailed);
         }
         blob = await resp.blob();
-        filename = `heatcut-${result.video_id}-${Math.round(clip.start_time)}-${Math.round(clip.end_time)}s.mp4`;
       } else {
         const resp = await fetch('/api/export', {
           method: 'POST',
@@ -1112,9 +1117,6 @@ Transcript:
           throw new Error(detail?.detail || t.results.exportFailed);
         }
         blob = await resp.blob();
-        const cd = resp.headers.get('content-disposition') || '';
-        const m = cd.match(/filename="?([^";]+)"?/i);
-        filename = m ? m[1] : `clip-${result.video_id}-${Math.round(clip.start_time)}-${Math.round(clip.end_time)}s.mp4`;
       }
 
       const url = URL.createObjectURL(blob);
@@ -1392,6 +1394,60 @@ Transcript:
             <polyline points="20 6 9 17 4 12"></polyline>
           </svg>
           {toastMessage}
+        </div>
+      )}
+
+      {/* Export in-flight: fake animated progress (30° black/white moving stripes */}
+      {exportingClipKey && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 6400,
+            background: 'rgba(0,0,0,0.55)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <style>{`
+@keyframes hc-stripes-move {
+  from { background-position: 0 0; }
+  to { background-position: 40px 0; }
+}`}</style>
+          <div
+            style={{
+              width: 'min(90vw, 460px)',
+              background: '#fff',
+              borderRadius: 14,
+              padding: '28px 24px 24px',
+              textAlign: 'center',
+              boxShadow: '0 18px 60px rgba(0,0,0,0.45)',
+            }}
+          >
+            <div
+              style={{
+                height: 34,
+                borderRadius: 8,
+                overflow: 'hidden',
+                border: '1px solid #d0d0d0',
+                background: '#f0f0f0',
+              }}
+            >
+              <div
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  backgroundImage:
+                    'repeating-linear-gradient(30deg, #111 0 10px, #fff 10px 20px)',
+                  animation: 'hc-stripes-move 0.7s linear infinite',
+                }}
+              />
+            </div>
+            <p style={{ margin: '16px 0 0', fontSize: '0.95rem', fontWeight: 600, color: '#222' }}>
+              {t.results.processingVideo}
+            </p>
+          </div>
         </div>
       )}
 

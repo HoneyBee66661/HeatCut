@@ -169,6 +169,7 @@ export const en = {
     transcriptTitle: "Transcript",
     downloadClip: "⬇ Download Clip (Raw)",
     preparingDownload: "Preparing download — may take a while on long videos…",
+    processingVideo: "Please wait — we're processing the video file…",
     exportFailed: "Export failed",
     signalRetention: "🔥 Retention",
     signalText: "✨ Text",
