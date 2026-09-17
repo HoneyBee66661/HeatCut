@@ -1130,6 +1130,30 @@ def _download_fmp4_window(fmt: dict, t0: float, t1: float) -> bytes:
     return init + media
 
 
+def _first_pts(path: str, stream: int) -> float | None:
+    """First packet PTS of a stream (content time of the first fragment).
+
+    The miner cuts video and audio DASH streams at their OWN fragment
+    boundaries, so the two can start at different content times (up to one
+    fragment apart) — merging as-is bakes in an A/V offset (audio ahead by
+    ~1s was reported). This returns the anchor used to resync via -itsoffset.
+    """
+    spec = "v:0" if stream == 0 else "a:0"
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", spec,
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0",
+             "-read_intervals", "%+#1", path],
+            capture_output=True, text=True, timeout=60)
+        for line in out.stdout.strip().splitlines():
+            line = line.strip()
+            if line and line.lower() != "n/a":
+                return float(line)
+    except (ValueError, subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
 def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) -> str:
     """Try a partial (fragment-range) export; raise on any failure."""
     import yt_dlp  # lazy: heavy scraping package
@@ -1170,10 +1194,21 @@ def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) 
         fh.write(_download_fmp4_window(afmt, cut_start, cut_end))
 
     merged = os.path.join(tmpdir, "merged.mp4")
-    m = subprocess.run(
-        ["ffmpeg", "-y", "-i", v_fmp4, "-i", a_fmp4, "-c", "copy",
-         "-movflags", "+faststart", merged],
-        capture_output=True, text=True, timeout=300)
+    prv, pra = _first_pts(v_fmp4, 0), _first_pts(a_fmp4, 0)
+    cmd = ["ffmpeg", "-y"]
+    if prv is not None and pra is not None and abs(prv - pra) > 0.05:
+        # Align both streams to the LATER content start: delay the earlier
+        # one so every output instant shows the same content time in both.
+        if prv > pra:
+            cmd += ["-itsoffset", f"{prv - pra:.3f}", "-i", a_fmp4, "-i", v_fmp4]
+        else:
+            cmd += ["-itsoffset", f"{pra - prv:.3f}", "-i", v_fmp4, "-i", a_fmp4]
+        print(f"[export] miner av-sync: v@{prv:.3f}s a@{pra:.3f}s "
+              f"-> shift {abs(prv - pra):.3f}s", flush=True)
+    else:
+        cmd += ["-i", v_fmp4, "-i", a_fmp4]
+    cmd += ["-c", "copy", "-movflags", "+faststart", merged]
+    m = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if m.returncode != 0 or not os.path.exists(merged) or os.path.getsize(merged) == 0:
         raise ValueError(f"fragment merge failed: {(m.stderr or '')[-200:]}")
 
