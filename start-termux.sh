@@ -25,6 +25,10 @@ PORT_API="${PORT_API:-8000}"
 PORT_WORKER="${HEATMAP_WORKER_PORT:-8765}"
 PORT_UI="${PORT_UI:-5173}"
 
+# optional local config (gitignored: .env.*): e.g. HEATMAP_WORKER_DRIVE_FOLDER,
+# DRIVE_OAUTH_JSON, PROXY_URL, YT_COOKIES_FILE — sourced so nohup'd services inherit.
+[ -f "$DIR/.worker.env" ] && set -a && . "$DIR/.worker.env" && set +a
+
 # --- detect mode ----------------------------------------------------------
 WORKER_ONLY=0
 if [ ! -x "$DIR/.venv/bin/python" ] && [ ! -d "$DIR/node_modules" ]; then

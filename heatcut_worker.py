@@ -44,6 +44,8 @@ miner when possible (only the needed seconds are downloaded — great for
 long videos) with a full-download fallback.
 """
 
+import base64
+import json
 import math
 import os
 import re
@@ -54,6 +56,8 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 # Windows Python 3.14 compatibility hotfix (same as backend/main.py)
 for flag in ('RTLD_LAZY', 'RTLD_NOW', 'RTLD_GLOBAL', 'RTLD_LOCAL',
@@ -81,6 +85,10 @@ app.add_middleware(
 HOST = os.environ.get("HEATMAP_WORKER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HEATMAP_WORKER_PORT", "8765"))
 CACHE_TTL = int(os.environ.get("HEATMAP_WORKER_CACHE_TTL", "600"))
+# Optional Drive mirror ("raw clip"): every exported clip is uploaded here.
+DRIVE_FOLDER_ID = os.environ.get("HEATMAP_WORKER_DRIVE_FOLDER", "").strip() or None
+DRIVE_OAUTH_JSON = (os.environ.get("DRIVE_OAUTH_JSON")
+                    or os.path.join(os.path.expanduser("~/.hermes"), "drive-oauth.json"))
 PAD_PRE = 2.0
 PAD_POST = 2.0
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -357,6 +365,82 @@ def _probe_duration(path: str) -> float:
 
 
 # ------------------------------------------------------------------
+# Optional Google Drive mirror (every exported clip -> "raw clip" folder)
+# ------------------------------------------------------------------
+def _drive_access_token() -> str:
+    """OAuth refresh token -> user's own Drive (stdlib only, no SA fallback)."""
+    if not os.path.exists(DRIVE_OAUTH_JSON):
+        raise RuntimeError(f"no OAuth creds at {DRIVE_OAUTH_JSON}")
+    with open(DRIVE_OAUTH_JSON) as fh:
+        cfg = json.load(fh)
+    body = json.dumps({
+        "client_id": cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "refresh_token": cfg["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=body,
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=30).read())["access_token"]
+
+
+def _drive_find(tok: str, name: str) -> list:
+    q = urllib.parse.quote(
+        f"'{DRIVE_FOLDER_ID}' in parents and name = '{name}' and trashed = false")
+    req = urllib.request.Request(
+        f"https://www.googleapis.com/drive/v3/files?q={q}&fields=files(id,name)&pageSize=10",
+        headers={"Authorization": f"Bearer {tok}"})
+    return json.loads(urllib.request.urlopen(req, timeout=30).read()).get("files", [])
+
+
+def _drive_upload(out_path: str, filename: str):
+    """Best-effort mirror of an exported clip to the configured Drive folder.
+
+    Idempotent by filename (re-export of the same window overwrites). Enabled
+    only when HEATMAP_WORKER_DRIVE_FOLDER is set; never fails the request.
+    """
+    if not DRIVE_FOLDER_ID:
+        return
+    try:
+        tok = _drive_access_token()
+        mime = "video/mp4"
+        size = os.path.getsize(out_path)
+        if size > 250 * 1024 * 1024:
+            print(f"[export] drive mirror SKIPPED {filename}: {size // (1024*1024)}MB > 250MB cap",
+                  flush=True)
+            return
+        with open(out_path, "rb") as fh:
+            data = fh.read()
+        boundary = "----hc" + base64.b64encode(os.urandom(9)).decode()
+        existing = _drive_find(tok, filename)
+        if existing:
+            fid = existing[0]["id"]
+            meta = json.dumps({"name": filename, "mimeType": mime})  # parents NOT writable on PATCH
+            url = f"https://www.googleapis.com/upload/drive/v3/files/{fid}?uploadType=multipart"
+            method = "PATCH"
+            verb = "UPDATED"
+        else:
+            meta = json.dumps({"name": filename, "mimeType": mime, "parents": [DRIVE_FOLDER_ID]})
+            url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+            method = "POST"
+            verb = "CREATED"
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\n"
+                f"Content-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"\r\n"
+                f"Content-Type: {mime}\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            url, method=method,
+            headers={"Authorization": f"Bearer {tok}",
+                     "Content-Type": f"multipart/related; boundary={boundary}"},
+            data=body)
+        res = json.loads(urllib.request.urlopen(req, timeout=300).read())
+        print(f"[export] drive mirror {verb} {filename} ({len(data)//1024}KB, id {res['id']})",
+              flush=True)
+    except Exception as e:  # noqa: BLE001 — mirror is best-effort
+        print(f"[export] drive mirror FAILED {filename}: {str(e)[:200]}", flush=True)
+
+
+# ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
 @app.get("/health")
@@ -426,6 +510,7 @@ def export(video_id: str, start_time: float, end_time: float, title: str = ""):
     slug = re.sub(r"[^A-Za-z0-9]+", "-", base).strip("-").lower()[:60] or f"clip-{video_id}"
     filename = f"{slug}-{int(float(start_time))}-{int(float(end_time))}s.mp4"
     print(f"[export] {video_id} {start_time}-{end_time}s -> {filename}", flush=True)
+    _drive_upload(out, filename)
     return FileResponse(
         out,
         media_type="video/mp4",
@@ -438,5 +523,6 @@ if __name__ == "__main__":
     import uvicorn
 
     print(f"HeatCut device worker on http://{HOST}:{PORT} "
-          f"(heatmap + export, cookies={'yes' if _cookiefile() else 'no'})")
+          f"(heatmap + export, cookies={'yes' if _cookiefile() else 'no'}, "
+          f"drive-mirror={'yes' if DRIVE_FOLDER_ID else 'no'})")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
