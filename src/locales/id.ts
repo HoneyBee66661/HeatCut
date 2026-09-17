@@ -171,6 +171,7 @@ export const id: Translations = {
     transcriptTitle: "Transkrip",
     downloadClip: "⬇ Unduh Klip (Raw)",
     preparingDownload: "Menyiapkan unduhan — bisa lama untuk video panjang…",
+    processingVideo: "Mohon tunggu — kami sedang memproses file video…",
     exportFailed: "Gagal mengekspor",
     signalRetention: "🔥 Retention",
     signalText: "✨ Teks",
