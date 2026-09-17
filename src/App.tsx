@@ -44,7 +44,10 @@ declare global {
   }
 }
 
-const HEATMAP_WORKER_URL = 'http://127.0.0.1:8765';
+// Cloud deploy override: set VITE_HEATMAP_WORKER_URL at build time (Vercel env)
+// to point at a tunneled/remote worker; default remains the on-device loopback.
+const HEATMAP_WORKER_URL: string =
+  (import.meta.env.VITE_HEATMAP_WORKER_URL as string | undefined) || 'http://127.0.0.1:8765';
 
 const MODEL_PRESETS: Record<string, string[]> = {
   openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini'],
