@@ -49,6 +49,20 @@ declare global {
 const HEATMAP_WORKER_URL: string =
   (import.meta.env.VITE_HEATMAP_WORKER_URL as string | undefined) || 'http://127.0.0.1:8765';
 
+// Shared secret for a REMOTE worker (see HEATMAP_WORKER_TOKEN in heatcut_worker.py).
+// Sent as X-Heatcut-Token; ignored by a worker that has no token configured.
+const HEATMAP_WORKER_TOKEN: string =
+  (import.meta.env.VITE_HEATMAP_WORKER_TOKEN as string | undefined) || '';
+
+const IS_LOOPBACK_WORKER = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(HEATMAP_WORKER_URL);
+
+// A tunneled worker answers far slower than loopback (TLS + edge + round trip),
+// so the 400ms probe that is right for 127.0.0.1 would give up too early.
+const WORKER_PROBE_TIMEOUT_MS = IS_LOOPBACK_WORKER ? 400 : 2500;
+
+const workerHeaders = (): Record<string, string> =>
+  HEATMAP_WORKER_TOKEN ? { 'X-Heatcut-Token': HEATMAP_WORKER_TOKEN } : {};
+
 const MODEL_PRESETS: Record<string, string[]> = {
   openai: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini'],
   anthropic: ['claude-sonnet-4-5', 'claude-haiku-4-5', 'claude-opus-4-1'],
@@ -823,9 +837,9 @@ export default function App() {
       let deviceMeta: { client_heatmap: { start_time: number; end_time: number; value: number }[]; client_title: string; client_duration: number } | null = null;
       if (vid) {
         try {
-          const hc = await fetch(`${HEATMAP_WORKER_URL}/health`, { signal: AbortSignal.timeout(400) });
+          const hc = await fetch(`${HEATMAP_WORKER_URL}/health`, { signal: AbortSignal.timeout(WORKER_PROBE_TIMEOUT_MS) });
           if (hc.ok) {
-            const hm = await fetch(`${HEATMAP_WORKER_URL}/heatmap?video_id=${encodeURIComponent(vid)}`, { signal: AbortSignal.timeout(15000) });
+            const hm = await fetch(`${HEATMAP_WORKER_URL}/heatmap?video_id=${encodeURIComponent(vid)}`, { headers: workerHeaders(), signal: AbortSignal.timeout(20000) });
             if (hm.ok) {
               const j = await hm.json();
               if (Array.isArray(j.heatmap) && j.heatmap.length > 0) {
@@ -862,6 +876,13 @@ export default function App() {
           base_url: aiProvider === 'openai-compatible' ? (aiBaseUrl.trim() || undefined) : undefined,
         }),
       });
+
+      if (!response.ok) {
+        // Non-200 (rate limit, bad request, …) returns JSON, not an SSE stream —
+        // surface the real message instead of silently ending the stream.
+        const detail = await response.json().catch(() => null);
+        throw new Error(detail?.detail || `Server error ${response.status}`);
+      }
 
       if (!response.body) throw new Error('No response stream from server.');
 
@@ -1081,7 +1102,7 @@ Transcript:
       // residential connection and streams the file straight to this tab.
       let workerOnline = false;
       try {
-        const probe = await fetch(`${HEATMAP_WORKER_URL}/health`, { signal: AbortSignal.timeout(400) });
+        const probe = await fetch(`${HEATMAP_WORKER_URL}/health`, { signal: AbortSignal.timeout(WORKER_PROBE_TIMEOUT_MS) });
         workerOnline = probe.ok;
       } catch {
         workerOnline = false;
@@ -1095,7 +1116,7 @@ Transcript:
           end_time: String(clip.end_time),
           title: result.title,
         }).toString();
-        const resp = await fetch(`${HEATMAP_WORKER_URL}/export?${qs}`);
+        const resp = await fetch(`${HEATMAP_WORKER_URL}/export?${qs}`, { headers: workerHeaders() });
         if (!resp.ok) {
           const detail = await resp.json().catch(() => null);
           throw new Error(detail?.detail || t.results.exportFailed);

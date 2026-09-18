@@ -33,7 +33,7 @@ import time
 import threading
 import uuid
 from typing import List, Optional, Any
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -115,6 +115,54 @@ def _resolve_export_tmp_root() -> str:
 EXPORT_TMP_ROOT = _resolve_export_tmp_root()
 EXPORT_TMP_OK = _usable_tmp_root(EXPORT_TMP_ROOT)
 logger.info("export tmp root: %s  ttl=%ds  writable=%s", EXPORT_TMP_ROOT, EXPORT_TTL_SECONDS, EXPORT_TMP_OK)
+
+# ---------------------------------------------------------------- Fair use
+# /api/analyze can spend the SERVER's own GEMINI_API_KEY / Supadata keys, so a
+# shared link must not be an open bar. Best-effort per-IP caps: memory only, so
+# they reset with each serverless instance — good enough to stop casual abuse of
+# a small circle. 0 disables a cap.
+ANALYZE_RATE_LIMIT = int(os.environ.get("HEATCUT_ANALYZE_RATE_LIMIT", "20"))   # per IP per hour
+ANALYZE_DAILY_CAP = int(os.environ.get("HEATCUT_ANALYZE_DAILY_CAP", "60"))     # per IP per day
+
+_rate_lock = threading.Lock()
+_rate_hits: dict = {}  # "kind:ip" -> [timestamps]
+
+
+def _client_ip(request: Request) -> str:
+    """Caller IP for rate limits.
+
+    Vercel puts the real client first in `x-forwarded-for`; behind a Cloudflare
+    tunnel the edge sets `cf-connecting-ip`. Both are client-settable in
+    principle — treat these caps as anti-casual-abuse, not authentication.
+    """
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf:
+        return cf
+    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if xff:
+        return xff
+    real = (request.headers.get("x-real-ip") or "").strip()
+    if real:
+        return real
+    return (request.client.host if request.client else "") or "unknown"
+
+
+def _rate_limited(key: str, limit: int, window: float) -> bool:
+    """Record a hit for key; True when it already used up `limit` hits/window."""
+    if limit <= 0:
+        return False
+    now = time.time()
+    with _rate_lock:
+        hits = [t for t in _rate_hits.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            _rate_hits[key] = hits
+            return True
+        hits.append(now)
+        _rate_hits[key] = hits
+        if len(_rate_hits) > 2000:  # keep the ledger bounded
+            for k in [k for k, v in _rate_hits.items() if not v]:
+                _rate_hits.pop(k, None)
+    return False
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1858,8 +1906,23 @@ def _parse_json_response(raw_text: str) -> Optional[dict]:
 
 
 @app.post("/api/analyze")
-async def analyze_video(request: AnalyzeRequest):
+async def analyze_video(request: AnalyzeRequest, http_request: Request):
     """Stream real-time progress via Server-Sent Events, then deliver the final result."""
+    # ── Fair-use guards (per caller IP, best-effort) ────────────────────────
+    # The server may hold its own GEMINI_API_KEY / Supadata keys, which makes
+    # /api/analyze spendable by whoever has the link. These caps keep a small
+    # circle usable without letting a stranger drain the quota.
+    ip = _client_ip(http_request)
+    if _rate_limited(f"analyze:{ip}", ANALYZE_RATE_LIMIT, 3600.0):
+        raise HTTPException(status_code=429, detail=(
+            f"Batas pemakaian: maks {ANALYZE_RATE_LIMIT} analisis per jam dari IP ini. "
+            "Coba lagi nanti, atau isi API key sendiri."
+        ))
+    if _rate_limited(f"analyze-day:{ip}", ANALYZE_DAILY_CAP, 86400.0):
+        raise HTTPException(status_code=429, detail=(
+            f"Batas harian tercapai (maks {ANALYZE_DAILY_CAP} analisis/hari dari IP ini). "
+            "Coba lagi besok, atau isi API key sendiri."
+        ))
 
     async def stream():
         provider = (request.provider or "gemini").strip().lower()

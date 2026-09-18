@@ -49,6 +49,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import socket
 import struct
@@ -71,7 +72,7 @@ if not hasattr(os, 'uname'):
     _Uname = namedtuple('UnameResult', ['sysname', 'nodename', 'release', 'version', 'machine'])
     os.uname = lambda: _Uname('Windows', 'localhost', '10', '10.0', 'AMD64')
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
@@ -87,6 +88,79 @@ app.add_middleware(
 HOST = os.environ.get("HEATMAP_WORKER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("HEATMAP_WORKER_PORT", "8765"))
 CACHE_TTL = int(os.environ.get("HEATMAP_WORKER_CACHE_TTL", "600"))
+
+# ---------------------------------------------------------------- Sharing guards
+# This worker can serve EXPORTS on the owner's residential IP, cookies and
+# bandwidth, so anything that exposes it beyond loopback (a tunnel, a LAN, a
+# VPS) must carry these guards:
+#   HEATMAP_WORKER_TOKEN          shared secret; when set, /heatmap and /export
+#                                 need header `X-Heatcut-Token` (or ?token=).
+#                                 /health stays open — it is the reachability
+#                                 probe used by the web app.
+#   HEATCUT_WORKER_RATE_LIMIT     max exports per IP per hour (0 = off)
+#   HEATCUT_WORKER_HEATMAP_LIMIT  max heatmap fetches per IP per hour (0 = off)
+#   HEATCUT_WORKER_MAX_CONCURRENCY  parallel exports allowed (keep 1-2: each one
+#                                 spawns yt-dlp/ffmpeg and eats bandwidth)
+# Note: a token baked into a public frontend build is only a soft barrier (anyone
+# who can read the JS bundle can read it). It stops scanners/bots and accidental
+# use; treat the app URL itself as part of the secret.
+WORKER_TOKEN = (os.environ.get("HEATMAP_WORKER_TOKEN") or "").strip() or None
+EXPORT_RATE_LIMIT = int(os.environ.get("HEATCUT_WORKER_RATE_LIMIT", "20"))
+HEATMAP_RATE_LIMIT = int(os.environ.get("HEATCUT_WORKER_HEATMAP_LIMIT", "60"))
+MAX_CONCURRENT_EXPORTS = max(1, int(os.environ.get("HEATCUT_WORKER_MAX_CONCURRENCY", "1")))
+EXPORT_BUSY_WAIT = float(os.environ.get("HEATCUT_WORKER_BUSY_WAIT", "25"))
+
+_rate_lock = threading.Lock()
+_rate_hits = {}  # "kind:ip" -> [timestamps]
+_export_slots = threading.Semaphore(MAX_CONCURRENT_EXPORTS)
+
+
+def _client_ip(request: Request) -> str:
+    """Caller IP for rate limits.
+
+    Behind the Cloudflare tunnel the edge sets `cf-connecting-ip` (not
+    spoofable); Vercel puts the real client first in `x-forwarded-for`. Both
+    headers are client-settable in principle — treat these limits as
+    anti-casual-abuse, not as authentication (the worker token is the gate).
+    """
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf:
+        return cf
+    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if xff:
+        return xff
+    real = (request.headers.get("x-real-ip") or "").strip()
+    if real:
+        return real
+    return (request.client.host if request.client else "") or "unknown"
+
+
+def _rate_limited(key: str, limit: int, window: float = 3600.0) -> bool:
+    """Record a hit for key; True when it already used up `limit` hits/window."""
+    if limit <= 0:
+        return False
+    now = time.time()
+    with _rate_lock:
+        hits = [t for t in _rate_hits.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            _rate_hits[key] = hits
+            return True
+        hits.append(now)
+        _rate_hits[key] = hits
+        if len(_rate_hits) > 1000:  # keep the ledger bounded
+            for k in [k for k, v in _rate_hits.items() if not v]:
+                _rate_hits.pop(k, None)
+    return False
+
+
+def _require_token(request: Request) -> None:
+    """401 unless the caller presents HEATMAP_WORKER_TOKEN (no-op when unset)."""
+    if not WORKER_TOKEN:
+        return
+    sent = (request.headers.get("x-heatcut-token") or request.query_params.get("token") or "").strip()
+    if not secrets.compare_digest(sent, WORKER_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized: worker token missing or wrong.")
+
 # Optional Drive mirror ("raw clip"): every exported clip is uploaded here.
 DRIVE_FOLDER_ID = os.environ.get("HEATMAP_WORKER_DRIVE_FOLDER", "").strip() or None
 DRIVE_OAUTH_JSON = (os.environ.get("DRIVE_OAUTH_JSON")
@@ -739,15 +813,27 @@ def _drive_upload(out_path: str, filename: str):
 # ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
+@app.middleware("http")
+async def _log_client(request: Request, call_next):
+    """Log who is using the shared worker (format + abuse forensics)."""
+    if request.url.path in ("/export", "/heatmap"):
+        print(f"[worker] {request.method} {request.url.path} from {_client_ip(request)}", flush=True)
+    return await call_next(request)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "heatcut-device-worker", "version": "2.0.0",
-            "export": True}
+            "export": True, "auth_required": bool(WORKER_TOKEN)}
 
 
 @app.get("/heatmap")
-def heatmap(video_id: str):
+def heatmap(request: Request, video_id: str):
     """Return yt-dlp metadata + retention heatmap for a video, cached briefly."""
+    _require_token(request)
+    ip = _client_ip(request)
+    if _rate_limited(f"heatmap:{ip}", HEATMAP_RATE_LIMIT):
+        raise HTTPException(status_code=429, detail=f"Rate limit: maks {HEATMAP_RATE_LIMIT} heatmap/jam dari IP ini.")
     video_id = (video_id or "").strip()
     if not video_id:
         raise HTTPException(status_code=400, detail="video_id is required.")
@@ -765,8 +851,21 @@ def heatmap(video_id: str):
 
 
 @app.get("/export")
-def export(video_id: str, start_time: float, end_time: float, title: str = ""):
+def export(request: Request, video_id: str, start_time: float, end_time: float, title: str = ""):
     """Download a clip (stream-copy, padded ±2s) straight to the browser."""
+    _require_token(request)
+    ip = _client_ip(request)
+    if _rate_limited(f"export:{ip}", EXPORT_RATE_LIMIT):
+        raise HTTPException(status_code=429, detail=f"Rate limit: maks {EXPORT_RATE_LIMIT} export/jam dari IP ini.")
+    if not _export_slots.acquire(timeout=EXPORT_BUSY_WAIT):
+        raise HTTPException(status_code=429, detail="Worker sedang sibuk (ada export lain jalan) — coba lagi sebentar.")
+    try:
+        return _export_impl(video_id, start_time, end_time, title)
+    finally:
+        _export_slots.release()
+
+
+def _export_impl(video_id: str, start_time: float, end_time: float, title: str = ""):
     video_id = (video_id or "").strip()
     if not video_id:
         raise HTTPException(status_code=400, detail="video_id is required.")
