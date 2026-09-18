@@ -176,18 +176,38 @@ def _tree_latest_mtime(path: str) -> float:
 
 
 def _job_in_flight(path: str) -> bool:
-    """True when path carries a heartbeat marker from a live pid on this host."""
-    try:
-        with open(os.path.join(path, EXPORT_JOB_MARKER), "r", encoding="utf-8") as fh:
-            meta = json.load(fh)
-    except (OSError, ValueError):
-        return False
-    if not isinstance(meta, dict) or meta.get("host") != HOSTNAME:
+    """True when path carries a heartbeat marker from a live pid on this host.
+
+    Reads `.heatcut-job.json` AND its `.tmp` sibling: the heartbeat rewrites the
+    marker via os.replace, so there is a microsecond window where only the tmp
+    file exists. A marker file that is fresh but unparsable also counts as in
+    flight — a running job must never lose protection because a read landed
+    mid-write.
+    """
+    meta = None
+    fresh_marker = False
+    for name in (EXPORT_JOB_MARKER, f"{EXPORT_JOB_MARKER}.tmp"):
+        p = os.path.join(path, name)
+        try:
+            if time.time() - os.stat(p).st_mtime <= EXPORT_HEARTBEAT_SECONDS * 3:
+                fresh_marker = True
+        except OSError:
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            meta = None
+        if isinstance(meta, dict):
+            break
+    if not isinstance(meta, dict):
+        return fresh_marker  # marker present but mid-write / legacy layout
+    if meta.get("host") != HOSTNAME:
         return False
     try:
         return _pid_alive(int(meta.get("pid") or 0))
     except (TypeError, ValueError):
-        return False
+        return fresh_marker
 
 
 def _cleanup_expired_export_tmp():
