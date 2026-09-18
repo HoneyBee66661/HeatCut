@@ -50,6 +50,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -58,6 +59,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 # Windows Python 3.14 compatibility hotfix (same as backend/main.py)
 for flag in ('RTLD_LAZY', 'RTLD_NOW', 'RTLD_GLOBAL', 'RTLD_LOCAL',
@@ -82,7 +84,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HOST = os.environ.get("HEATMAP_WORKER_HOST", "127.0.0.1")
+HOST = os.environ.get("HEATMAP_WORKER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("HEATMAP_WORKER_PORT", "8765"))
 CACHE_TTL = int(os.environ.get("HEATMAP_WORKER_CACHE_TTL", "600"))
 # Optional Drive mirror ("raw clip"): every exported clip is uploaded here.
@@ -95,6 +97,207 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _cache = {}
 _cache_lock = threading.Lock()
+
+# ----------------------------------------------------------------
+# Shared export tmp workspace + liveness-aware TTL cleanup
+# Mirrors backend/main.py; both processes use the same HEATCUT_EXPORT_TMP dir.
+#
+# NOTE: a job dir's own mtime only moves when entries are added/removed, so a
+# long job writing ONE file (yt-dlp .part / ffmpeg output) used to look idle and
+# got pruned mid-write. Every job now writes a heartbeat marker
+# (.heatcut-job.json) and the cleaner skips dirs whose marker names a LIVE pid
+# on this host — which also stops the backend and the worker from deleting each
+# other's in-flight job (they share this root but each runs its own cleaner).
+# ----------------------------------------------------------------
+EXPORT_TMP_ROOT = os.environ.get("HEATCUT_EXPORT_TMP",
+                                 os.path.join(os.path.expanduser("~"), ".heatcut", "export_tmp"))
+EXPORT_TTL_SECONDS = int(os.environ.get("HEATCUT_EXPORT_TTL", "300"))  # idle/crashed jobs only
+EXPORT_CLEANUP_INTERVAL = 30
+EXPORT_HEARTBEAT_SECONDS = 5
+EXPORT_JOB_MARKER = ".heatcut-job.json"
+HOSTNAME = socket.gethostname()
+
+_export_jobs = {}  # job dir -> (stop_event, heartbeat thread)
+_export_jobs_lock = threading.Lock()
+
+try:
+    os.makedirs(EXPORT_TMP_ROOT, exist_ok=True)
+    print(f"[worker] export tmp root: {EXPORT_TMP_ROOT}  ttl={EXPORT_TTL_SECONDS}s", flush=True)
+except OSError:
+    print(f"[worker] WARNING: export tmp root {EXPORT_TMP_ROOT} is not writable", flush=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort "is this pid still running" check (POSIX + Windows)."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        # os.kill(pid, 0) is DESTRUCTIVE on Windows (TerminateProcess) — never use it.
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return True  # conservative: never prune what we cannot inspect
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _tree_latest_mtime(path: str) -> float:
+    """Newest mtime anywhere under path (the dir itself + every nested entry)."""
+    latest = os.path.getmtime(path)
+    for root, dirs, files in os.walk(path):
+        for name in list(dirs) + list(files):
+            try:
+                latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+            except OSError:
+                continue
+    return latest
+
+
+def _job_in_flight(path: str) -> bool:
+    """True when path carries a heartbeat marker from a live pid on this host."""
+    try:
+        with open(os.path.join(path, EXPORT_JOB_MARKER), "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(meta, dict) or meta.get("host") != HOSTNAME:
+        return False
+    try:
+        return _pid_alive(int(meta.get("pid") or 0))
+    except (TypeError, ValueError):
+        return False
+
+
+def _cleanup_expired_export_tmp():
+    """Delete job dirs that are neither in flight nor recently touched."""
+    now = time.time()
+    deleted = 0
+    try:
+        entries = os.listdir(EXPORT_TMP_ROOT)
+    except OSError:
+        return 0
+    for entry in entries:
+        path = os.path.join(EXPORT_TMP_ROOT, entry)
+        try:
+            if not os.path.isdir(path):
+                continue
+            if _job_in_flight(path):
+                continue  # an export is writing here right now
+            if now - _tree_latest_mtime(path) > EXPORT_TTL_SECONDS:
+                shutil.rmtree(path, ignore_errors=True)
+                deleted += 1
+        except OSError:
+            continue
+    return deleted
+
+
+def _start_export_tmp_cleanup():
+    def _run():
+        while True:
+            try:
+                n = _cleanup_expired_export_tmp()
+                if n:
+                    print(f"[worker] export tmp cleanup: deleted {n} expired dir(s)", flush=True)
+            except Exception:
+                print("[worker] export tmp cleanup error", flush=True)
+            time.sleep(EXPORT_CLEANUP_INTERVAL)
+
+    t = threading.Thread(target=_run, name="export-tmp-cleanup", daemon=True)
+    t.start()
+    print(f"[worker] export tmp cleanup thread started (ttl={EXPORT_TTL_SECONDS}s, interval={EXPORT_CLEANUP_INTERVAL}s)", flush=True)
+
+
+def _write_job_marker(marker: str, started: float):
+    """Atomically (re)write the job heartbeat marker."""
+    payload = {"pid": os.getpid(), "host": HOSTNAME, "started": started, "heartbeat": time.time()}
+    tmp = f"{marker}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, marker)
+    except OSError:
+        pass  # best-effort: the tree-mtime fallback still protects the dir
+
+
+def _make_export_tmp_dir() -> str:
+    """Create a per-job subdir under EXPORT_TMP_ROOT and start its heartbeat."""
+    ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    sub = f"{ts}_{uuid.uuid4().hex[:8]}"
+    path = os.path.join(EXPORT_TMP_ROOT, sub)
+    os.makedirs(path, exist_ok=True)
+    marker = os.path.join(path, EXPORT_JOB_MARKER)
+    started = time.time()
+    _write_job_marker(marker, started)  # marker exists BEFORE the job can block
+    stop = threading.Event()
+
+    def _beat():
+        while not stop.wait(EXPORT_HEARTBEAT_SECONDS):
+            _write_job_marker(marker, started)
+
+    t = threading.Thread(target=_beat, name="export-job-heartbeat", daemon=True)
+    t.start()
+    with _export_jobs_lock:
+        _export_jobs[path] = (stop, t)
+    return path
+
+
+def _clear_export_artifacts(path: str):
+    """Drop a job's partial artifacts but KEEP its liveness marker.
+
+    The marker is the only thing telling the TTL cleaner this dir is still in
+    use — wiping it here leaves the dir protected by tree-mtime alone until the
+    next heartbeat, so never delete it.
+    """
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return
+    for name in entries:
+        if name.startswith(EXPORT_JOB_MARKER):
+            continue
+        try:
+            os.remove(os.path.join(path, name))
+        except OSError:
+            pass
+
+
+def _finish_export_job(path: str):
+    """Job done (success or failure): stop its heartbeat and drop the workspace."""
+    with _export_jobs_lock:
+        entry = _export_jobs.pop(path, None)
+    if entry is not None:
+        stop, t = entry
+        stop.set()
+        t.join(timeout=EXPORT_HEARTBEAT_SECONDS + 5)  # wait() is interruptible
+    shutil.rmtree(path, ignore_errors=True)
+
+
+try:
+    _start_export_tmp_cleanup()
+except Exception:  # noqa: BLE001 — temp hygiene must never break startup
+    print("[worker] WARNING: export tmp cleanup thread not started", flush=True)
 
 
 def _proxy_url() -> str:
@@ -517,7 +720,7 @@ def export(video_id: str, start_time: float, end_time: float, title: str = ""):
     cut_start = max(0.0, float(start_time) - PAD_PRE)
     cut_end = float(end_time) + PAD_POST
     dur = cut_end - cut_start
-    tmpdir = tempfile.mkdtemp(prefix="hc_export_")
+    tmpdir = _make_export_tmp_dir()
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     try:
@@ -528,14 +731,10 @@ def export(video_id: str, start_time: float, end_time: float, title: str = ""):
                 raise ValueError(f"miner duration mismatch ({out_dur:.1f}s vs {dur:.1f}s)")
         except Exception as e:
             print(f"[export] fragment miner failed ({str(e)[:120]}) - full download fallback", flush=True)
-            for f in os.listdir(tmpdir):
-                try:
-                    os.remove(os.path.join(tmpdir, f))
-                except OSError:
-                    pass
+            _clear_export_artifacts(tmpdir)
             out = _legacy_full_export(url, tmpdir, cut_start, cut_end)
     except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        _finish_export_job(tmpdir)
         hint = ("YouTube blocked this download as a bot check. Export a cookies.txt "
                 "from a browser logged into YouTube and place it next to this script "
                 "(yt_cookies.txt), then retry.") if _is_botcheck(e) else ""
@@ -550,7 +749,9 @@ def export(video_id: str, start_time: float, end_time: float, title: str = ""):
         out,
         media_type="video/mp4",
         filename=filename,
-        background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        # Heartbeat keeps running until the response is fully streamed out;
+        # _finish_export_job then stops it and removes the workspace.
+        background=BackgroundTask(_finish_export_job, tmpdir),
     )
 
 
