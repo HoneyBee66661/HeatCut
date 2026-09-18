@@ -28,6 +28,7 @@ import logging
 import asyncio
 import json
 import shutil
+import tempfile
 import time
 import threading
 import uuid
@@ -64,7 +65,7 @@ logger = logging.getLogger("cheat-clip")
 # newest mtime over the WHOLE tree. This also makes the shared root safe: the
 # backend and the worker each run a cleaner, but neither can delete the
 # other's in-flight job. TTL therefore only governs crashed/abandoned jobs.
-EXPORT_TMP_ROOT = os.environ.get("HEATCUT_EXPORT_TMP", os.path.join(os.path.expanduser("~"), ".heatcut", "export_tmp"))
+EXPORT_TMP_ROOT_REQUESTED = os.environ.get("HEATCUT_EXPORT_TMP", os.path.join(os.path.expanduser("~"), ".heatcut", "export_tmp"))
 EXPORT_TTL_SECONDS = int(os.environ.get("HEATCUT_EXPORT_TTL", "300"))  # idle/crashed jobs only
 EXPORT_CLEANUP_INTERVAL = 30  # scan every 30 seconds
 EXPORT_HEARTBEAT_SECONDS = 5  # job liveness ping
@@ -74,12 +75,46 @@ HOSTNAME = socket.gethostname()
 _export_jobs: dict = {}  # job dir -> (stop_event, heartbeat thread)
 _export_jobs_lock = threading.Lock()
 
-try:
-    os.makedirs(EXPORT_TMP_ROOT, exist_ok=True)
-    logger.info("export tmp root: %s  ttl=%ds", EXPORT_TMP_ROOT, EXPORT_TTL_SECONDS)
-except OSError:
-    # Read-only FS / unwritable HOME must not break every /api/* route.
-    logger.warning("export tmp root %s is not writable — exports will fail", EXPORT_TMP_ROOT, exc_info=True)
+
+def _usable_tmp_root(path: str) -> bool:
+    """True when path can hold a job dir (create + write probe + clean up)."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".probe_{os.getpid()}")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_export_tmp_root() -> str:
+    """Configured root if usable, else the platform temp dir.
+
+    Serverless platforms (Vercel) mount everything read-only except the temp
+    dir, so the configured path under $HOME cannot even be created there. The
+    import must survive that (every /api/* route shares this module) AND the
+    export route must not crash with a bare 500 on the first makedirs — hence a
+    real fallback plus EXPORT_TMP_OK so /api/health can show the truth.
+    """
+    if _usable_tmp_root(EXPORT_TMP_ROOT_REQUESTED):
+        return EXPORT_TMP_ROOT_REQUESTED
+    fallback = os.path.join(tempfile.gettempdir(), "heatcut_export_tmp")
+    if fallback != EXPORT_TMP_ROOT_REQUESTED and _usable_tmp_root(fallback):
+        logger.warning(
+            "export tmp root %s is not writable — falling back to %s",
+            EXPORT_TMP_ROOT_REQUESTED, fallback,
+        )
+        return fallback
+    logger.warning("no writable export tmp root (%s and %s both failed) — exports will fail",
+                   EXPORT_TMP_ROOT_REQUESTED, fallback)
+    return EXPORT_TMP_ROOT_REQUESTED
+
+
+EXPORT_TMP_ROOT = _resolve_export_tmp_root()
+EXPORT_TMP_OK = _usable_tmp_root(EXPORT_TMP_ROOT)
+logger.info("export tmp root: %s  ttl=%ds  writable=%s", EXPORT_TMP_ROOT, EXPORT_TTL_SECONDS, EXPORT_TMP_OK)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -218,6 +253,11 @@ def _write_job_marker(marker: str, started: float) -> None:
 
 def _make_export_tmp_dir() -> str:
     """Create a per-job subdirectory under EXPORT_TMP_ROOT and start its heartbeat."""
+    if not EXPORT_TMP_OK:
+        # No writable workspace: fail loudly but *handled* — an unguarded raise
+        # here reaches the client as a bare "Internal Server Error" instead of a
+        # useful message (that is exactly what Vercel showed).
+        raise RuntimeError(f"export workspace not writable: {EXPORT_TMP_ROOT}")
     ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     sub = f"{ts}_{uuid.uuid4().hex[:8]}"
     path = os.path.join(EXPORT_TMP_ROOT, sub)
@@ -268,6 +308,19 @@ def _finish_export_job(path: str) -> None:
         stop.set()
         t.join(timeout=EXPORT_HEARTBEAT_SECONDS + 5)  # wait() is interruptible
     shutil.rmtree(path, ignore_errors=True)
+
+
+def _new_export_tmp_dir_or_500() -> str:
+    """Job workspace, or a clean JSON 500 — never a bare crash."""
+    try:
+        return _make_export_tmp_dir()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=(f"Export workspace unavailable on this host ({e}). Exports need "
+                    "a writable temp dir — on serverless hosts run heatcut_worker.py "
+                    "on your own device and download from there."),
+        ) from e
 
 
 # Start the TTL cleanup thread on module load (runs once per process).
@@ -1582,7 +1635,11 @@ def health_check():
         "is_vercel": is_vercel,
         "supadata_keys_count": len(keys),
         "proxy_configured": bool(proxy),
-        "gemini_env_configured": has_gemini
+        "gemini_env_configured": has_gemini,
+        # export workspace diagnostics: the configured path may be unwritable
+        # (serverless), in which case exports use EXPORT_TMP_ROOT's fallback.
+        "export_tmp_root": EXPORT_TMP_ROOT,
+        "export_tmp_ok": EXPORT_TMP_OK,
     }
 
 
@@ -2866,7 +2923,7 @@ async def export_clip(request: ExportRequest):
     import uuid
     from starlette.background import BackgroundTask
 
-    tmpdir = _make_export_tmp_dir()
+    tmpdir = _new_export_tmp_dir_or_500()
 
     def _run() -> str:
         import yt_dlp  # lazy: heavy scraping package

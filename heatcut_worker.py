@@ -109,8 +109,8 @@ _cache_lock = threading.Lock()
 # on this host — which also stops the backend and the worker from deleting each
 # other's in-flight job (they share this root but each runs its own cleaner).
 # ----------------------------------------------------------------
-EXPORT_TMP_ROOT = os.environ.get("HEATCUT_EXPORT_TMP",
-                                 os.path.join(os.path.expanduser("~"), ".heatcut", "export_tmp"))
+EXPORT_TMP_ROOT_REQUESTED = os.environ.get("HEATCUT_EXPORT_TMP",
+                                           os.path.join(os.path.expanduser("~"), ".heatcut", "export_tmp"))
 EXPORT_TTL_SECONDS = int(os.environ.get("HEATCUT_EXPORT_TTL", "300"))  # idle/crashed jobs only
 EXPORT_CLEANUP_INTERVAL = 30
 EXPORT_HEARTBEAT_SECONDS = 5
@@ -120,11 +120,35 @@ HOSTNAME = socket.gethostname()
 _export_jobs = {}  # job dir -> (stop_event, heartbeat thread)
 _export_jobs_lock = threading.Lock()
 
-try:
-    os.makedirs(EXPORT_TMP_ROOT, exist_ok=True)
-    print(f"[worker] export tmp root: {EXPORT_TMP_ROOT}  ttl={EXPORT_TTL_SECONDS}s", flush=True)
-except OSError:
-    print(f"[worker] WARNING: export tmp root {EXPORT_TMP_ROOT} is not writable", flush=True)
+
+def _usable_tmp_root(path: str) -> bool:
+    """True when path can hold a job dir (create + write probe + clean up)."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".probe_{os.getpid()}")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _resolve_export_tmp_root() -> str:
+    """Configured root if usable, else the platform temp dir (read-only hosts)."""
+    if _usable_tmp_root(EXPORT_TMP_ROOT_REQUESTED):
+        return EXPORT_TMP_ROOT_REQUESTED
+    fallback = os.path.join(tempfile.gettempdir(), "heatcut_export_tmp")
+    if fallback != EXPORT_TMP_ROOT_REQUESTED and _usable_tmp_root(fallback):
+        print(f"[worker] WARNING: {EXPORT_TMP_ROOT_REQUESTED} not writable — using {fallback}", flush=True)
+        return fallback
+    print(f"[worker] WARNING: no writable export tmp root ({EXPORT_TMP_ROOT_REQUESTED})", flush=True)
+    return EXPORT_TMP_ROOT_REQUESTED
+
+
+EXPORT_TMP_ROOT = _resolve_export_tmp_root()
+EXPORT_TMP_OK = _usable_tmp_root(EXPORT_TMP_ROOT)
+print(f"[worker] export tmp root: {EXPORT_TMP_ROOT}  ttl={EXPORT_TTL_SECONDS}s  writable={EXPORT_TMP_OK}", flush=True)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -263,6 +287,8 @@ def _write_job_marker(marker: str, started: float):
 
 def _make_export_tmp_dir() -> str:
     """Create a per-job subdir under EXPORT_TMP_ROOT and start its heartbeat."""
+    if not EXPORT_TMP_OK:
+        raise RuntimeError(f"export workspace not writable: {EXPORT_TMP_ROOT}")
     ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     sub = f"{ts}_{uuid.uuid4().hex[:8]}"
     path = os.path.join(EXPORT_TMP_ROOT, sub)
@@ -312,6 +338,18 @@ def _finish_export_job(path: str):
         stop.set()
         t.join(timeout=EXPORT_HEARTBEAT_SECONDS + 5)  # wait() is interruptible
     shutil.rmtree(path, ignore_errors=True)
+
+
+def _new_export_tmp_dir_or_500() -> str:
+    """Job workspace, or a clean JSON 500 — never a bare crash."""
+    try:
+        return _make_export_tmp_dir()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=(f"Export workspace unavailable on this device ({e}). Set "
+                    "HEATCUT_EXPORT_TMP to a writable directory and retry."),
+        ) from e
 
 
 try:
@@ -740,7 +778,7 @@ def export(video_id: str, start_time: float, end_time: float, title: str = ""):
     cut_start = max(0.0, float(start_time) - PAD_PRE)
     cut_end = float(end_time) + PAD_POST
     dur = cut_end - cut_start
-    tmpdir = _make_export_tmp_dir()
+    tmpdir = _new_export_tmp_dir_or_500()
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     try:
