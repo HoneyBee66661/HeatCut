@@ -5,6 +5,7 @@
 # ─── SECRETS & ENVIRONMENT ───────────────────────────────────
 .env
 .env.*
+.worker.env
 !.env.template
 !.env.example
 backend/yt_cookies.txt
