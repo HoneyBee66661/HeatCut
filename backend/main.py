@@ -21,11 +21,16 @@ load_dotenv()
 
 import re
 import math
+import socket
 import struct
 import subprocess
 import logging
 import asyncio
 import json
+import shutil
+import time
+import threading
+import uuid
 from typing import List, Optional, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
@@ -40,6 +45,217 @@ from google.genai import types
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cheat-clip")
+
+# ----------------------------------------------------------------
+# Dedicated temp workspace + liveness-aware TTL cleanup
+# ----------------------------------------------------------------
+# All export/worker processing artifacts land in one shared directory
+# instead of scattered tempfile.mkdtemp() calls. A background thread scans it
+# every 30s and prunes job dirs that are BOTH unused and older than the TTL.
+#
+# Why mtime alone is NOT enough (regression fixed here): a directory's own
+# mtime only moves when entries are added/removed, so a long job that keeps
+# writing ONE file (yt-dlp `.part`, ffmpeg output) looks idle — the cleaner
+# deleted a live job dir mid-write, the writer kept filling an unlinked inode
+# and the next open() raised FileNotFoundError. So every job now writes a
+# heartbeat marker (.heatcut-job.json: pid/host/heartbeat) every
+# EXPORT_HEARTBEAT_SECONDS; the cleaner SKIPS any dir whose marker names a pid
+# that is still alive on this host, and for everything else falls back to the
+# newest mtime over the WHOLE tree. This also makes the shared root safe: the
+# backend and the worker each run a cleaner, but neither can delete the
+# other's in-flight job. TTL therefore only governs crashed/abandoned jobs.
+EXPORT_TMP_ROOT = os.environ.get("HEATCUT_EXPORT_TMP", os.path.join(os.path.expanduser("~"), ".heatcut", "export_tmp"))
+EXPORT_TTL_SECONDS = int(os.environ.get("HEATCUT_EXPORT_TTL", "300"))  # idle/crashed jobs only
+EXPORT_CLEANUP_INTERVAL = 30  # scan every 30 seconds
+EXPORT_HEARTBEAT_SECONDS = 5  # job liveness ping
+EXPORT_JOB_MARKER = ".heatcut-job.json"
+HOSTNAME = socket.gethostname()
+
+_export_jobs: dict = {}  # job dir -> (stop_event, heartbeat thread)
+_export_jobs_lock = threading.Lock()
+
+try:
+    os.makedirs(EXPORT_TMP_ROOT, exist_ok=True)
+    logger.info("export tmp root: %s  ttl=%ds", EXPORT_TMP_ROOT, EXPORT_TTL_SECONDS)
+except OSError:
+    # Read-only FS / unwritable HOME must not break every /api/* route.
+    logger.warning("export tmp root %s is not writable — exports will fail", EXPORT_TMP_ROOT, exc_info=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort "is this pid still running" check (POSIX + Windows)."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        # os.kill(pid, 0) is DESTRUCTIVE on Windows (TerminateProcess) — never use it.
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return True  # conservative: never prune what we cannot inspect
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _tree_latest_mtime(path: str) -> float:
+    """Newest mtime anywhere under path (the dir itself + every nested entry)."""
+    latest = os.path.getmtime(path)
+    for root, dirs, files in os.walk(path):
+        for name in list(dirs) + list(files):
+            try:
+                latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+            except OSError:
+                continue
+    return latest
+
+
+def _job_in_flight(path: str) -> bool:
+    """True when path carries a heartbeat marker from a live pid on this host."""
+    try:
+        with open(os.path.join(path, EXPORT_JOB_MARKER), "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(meta, dict) or meta.get("host") != HOSTNAME:
+        return False
+    try:
+        return _pid_alive(int(meta.get("pid") or 0))
+    except (TypeError, ValueError):
+        return False
+
+
+def _cleanup_expired_export_tmp() -> int:
+    """Delete job dirs that are neither in flight nor recently touched."""
+    now = time.time()
+    deleted = 0
+    try:
+        entries = os.listdir(EXPORT_TMP_ROOT)
+    except OSError:
+        return 0  # permissions / missing dir — best-effort only
+    for entry in entries:
+        path = os.path.join(EXPORT_TMP_ROOT, entry)
+        try:
+            if not os.path.isdir(path):
+                continue
+            if _job_in_flight(path):
+                continue  # an export is writing here right now
+            if now - _tree_latest_mtime(path) > EXPORT_TTL_SECONDS:
+                shutil.rmtree(path, ignore_errors=True)
+                deleted += 1
+        except OSError:
+            continue
+    return deleted
+
+
+def _start_export_tmp_cleanup() -> None:
+    """Spawn a daemon thread that prunes expired export tmp dirs."""
+
+    def _run() -> None:
+        while True:
+            try:
+                _cleanup_expired_export_tmp()
+            except Exception:  # noqa: BLE001 — never let cleanup kill the server
+                logger.exception("export tmp cleanup failed")
+            time.sleep(EXPORT_CLEANUP_INTERVAL)
+
+    t = threading.Thread(target=_run, name="export-tmp-cleanup", daemon=True)
+    t.start()
+    logger.info("export tmp cleanup thread started (ttl=%ds, interval=%ds)", EXPORT_TTL_SECONDS, EXPORT_CLEANUP_INTERVAL)
+
+
+def _write_job_marker(marker: str, started: float) -> None:
+    """Atomically (re)write the job heartbeat marker."""
+    payload = {"pid": os.getpid(), "host": HOSTNAME, "started": started, "heartbeat": time.time()}
+    tmp = f"{marker}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, marker)  # readers never see a partial marker
+    except OSError:
+        pass  # best-effort: the tree-mtime fallback still protects the dir
+
+
+def _make_export_tmp_dir() -> str:
+    """Create a per-job subdirectory under EXPORT_TMP_ROOT and start its heartbeat."""
+    ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    sub = f"{ts}_{uuid.uuid4().hex[:8]}"
+    path = os.path.join(EXPORT_TMP_ROOT, sub)
+    os.makedirs(path, exist_ok=True)
+    marker = os.path.join(path, EXPORT_JOB_MARKER)
+    started = time.time()
+    _write_job_marker(marker, started)  # marker exists BEFORE the job can block
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(EXPORT_HEARTBEAT_SECONDS):
+            _write_job_marker(marker, started)
+
+    t = threading.Thread(target=_beat, name="export-job-heartbeat", daemon=True)
+    t.start()
+    with _export_jobs_lock:
+        _export_jobs[path] = (stop, t)
+    return path
+
+
+def _clear_export_artifacts(path: str) -> None:
+    """Drop a job's partial artifacts but KEEP its liveness marker.
+
+    The marker is the only thing telling the TTL cleaner this dir is still in
+    use — wiping it here (as a naive `for f in os.listdir(tmpdir): remove(f)`
+    does) leaves the dir protected by tree-mtime alone until the next
+    heartbeat, so never delete it.
+    """
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return
+    for name in entries:
+        if name.startswith(EXPORT_JOB_MARKER):
+            continue
+        try:
+            os.remove(os.path.join(path, name))
+        except OSError:
+            pass
+
+
+def _finish_export_job(path: str) -> None:
+    """Job done (success or failure): stop its heartbeat and drop the workspace."""
+    with _export_jobs_lock:
+        entry = _export_jobs.pop(path, None)
+    if entry is not None:
+        stop, t = entry
+        stop.set()
+        t.join(timeout=EXPORT_HEARTBEAT_SECONDS + 5)  # wait() is interruptible
+    shutil.rmtree(path, ignore_errors=True)
+
+
+# Start the TTL cleanup thread on module load (runs once per process).
+try:
+    _start_export_tmp_cleanup()
+except Exception:  # noqa: BLE001 — temp hygiene must never break module import
+    logger.warning("export tmp cleanup thread not started", exc_info=True)
+
 
 app = FastAPI(title="HEATCUT API", description="AI-powered YouTube Viral Hotspot Finder")
 
@@ -2627,9 +2843,10 @@ async def export_clip(request: ExportRequest):
     import shutil
     import subprocess
     import tempfile
+    import uuid
     from starlette.background import BackgroundTask
 
-    tmpdir = tempfile.mkdtemp(prefix="cc_export_")
+    tmpdir = _make_export_tmp_dir()
 
     def _run() -> str:
         import yt_dlp  # lazy: heavy scraping package
@@ -2662,11 +2879,7 @@ async def export_clip(request: ExportRequest):
             raise ValueError(f"miner output duration mismatch ({out_dur:.1f}s vs window {dur:.1f}s)")
         except Exception as e:
             logger.warning(f"Fragment-miner export failed ({str(e)[:120]}) — falling back to full download.")
-            for f in os.listdir(tmpdir):  # remove partial miner artifacts
-                try:
-                    os.remove(os.path.join(tmpdir, f))
-                except OSError:
-                    pass
+            _clear_export_artifacts(tmpdir)
 
         # ── Fallback: full DASH download + local stream-copy cut ─────────
         # Used when the fragment miner cannot run (no sidx, unsupported
@@ -2734,7 +2947,7 @@ async def export_clip(request: ExportRequest):
     try:
         out_mp4 = await asyncio.to_thread(_run)
     except Exception as e:  # noqa: BLE001 — surface a clean API error to the client
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        _finish_export_job(tmpdir)
         friendly = _botcheck_message(e)
         raise HTTPException(status_code=500, detail=f"Export failed: {friendly or e}")
 
@@ -2745,6 +2958,8 @@ async def export_clip(request: ExportRequest):
         out_mp4,
         media_type="video/mp4",
         filename=filename,
-        background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        # Heartbeat keeps running until the response is fully streamed out;
+        # _finish_export_job then stops it and removes the workspace.
+        background=BackgroundTask(_finish_export_job, tmpdir),
     )
 
