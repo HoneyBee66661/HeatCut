@@ -1397,7 +1397,7 @@ Transcript:
         </div>
       )}
 
-      {/* Export in-flight: fake animated progress (30° black/white moving stripes */}
+      {/* Export in-flight: fake animated progress (plain B/W barber-pole stripes) */}
       {exportingClipKey && (
         <div
           style={{
@@ -1439,7 +1439,7 @@ Transcript:
                   width: '100%',
                   height: '100%',
                   backgroundImage:
-                    'repeating-linear-gradient(30deg, #111 0 10px, #fff 10px 20px)',
+                    'repeating-linear-gradient(90deg, #111 0 10px, #fff 10px 20px)',
                   animation: 'hc-stripes-move 0.7s linear infinite',
                 }}
               />
