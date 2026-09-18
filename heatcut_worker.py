@@ -116,10 +116,22 @@ _export_slots = threading.Semaphore(MAX_CONCURRENT_EXPORTS)
 
 
 def _client_ip(request: Request) -> str:
-    """Caller IP, honouring the proxy header a tunnel/edge adds."""
+    """Caller IP for rate limits.
+
+    Behind the Cloudflare tunnel the edge sets `cf-connecting-ip` (not
+    spoofable); Vercel puts the real client first in `x-forwarded-for`. Both
+    headers are client-settable in principle — treat these limits as
+    anti-casual-abuse, not as authentication (the worker token is the gate).
+    """
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf:
+        return cf
     xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     if xff:
         return xff
+    real = (request.headers.get("x-real-ip") or "").strip()
+    if real:
+        return real
     return (request.client.host if request.client else "") or "unknown"
 
 
@@ -801,6 +813,14 @@ def _drive_upload(out_path: str, filename: str):
 # ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
+@app.middleware("http")
+async def _log_client(request: Request, call_next):
+    """Log who is using the shared worker (format + abuse forensics)."""
+    if request.url.path in ("/export", "/heatmap"):
+        print(f"[worker] {request.method} {request.url.path} from {_client_ip(request)}", flush=True)
+    return await call_next(request)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "heatcut-device-worker", "version": "2.0.0",

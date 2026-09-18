@@ -129,10 +129,21 @@ _rate_hits: dict = {}  # "kind:ip" -> [timestamps]
 
 
 def _client_ip(request: Request) -> str:
-    """Caller IP, honouring the proxy header Vercel/any edge adds."""
+    """Caller IP for rate limits.
+
+    Vercel puts the real client first in `x-forwarded-for`; behind a Cloudflare
+    tunnel the edge sets `cf-connecting-ip`. Both are client-settable in
+    principle — treat these caps as anti-casual-abuse, not authentication.
+    """
+    cf = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf:
+        return cf
     xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     if xff:
         return xff
+    real = (request.headers.get("x-real-ip") or "").strip()
+    if real:
+        return real
     return (request.client.host if request.client else "") or "unknown"
 
 
