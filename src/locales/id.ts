@@ -276,5 +276,22 @@ export const id: Translations = {
     timestampsCopied: "Timestamp",
     copyCopied: "Copy klip",
     exportFailed: "Export gagal",
+    openAtTime: "Buka di detik ini",
+    copyLink: "Copy link",
+    linkCopied: "Link lompat",
+    manualBadge: "potong manual",
+    retryDownload: "Ulangi",
+    manualTitle: (n: number) => `${n} window diblokir dari auto-download — potong manual`,
+    manualHint: "YouTube nolak ambil medianya untuk window ini (403 / bot check). Tiap window tetap bawa link lompat berlabel ke detik persisnya: buka, lalu potong manual di editor, atau ulangi download.",
+    manualListTitle: "Manual cut list",
+    manualCopyList: "Copy manual list",
+    manualCopyListCount: (n: number) => `Copy manual list (${n})`,
+    manualDownloadList: "Manual list .md",
+    manualListCopied: "Manual cut list",
+    manualFallback: (msg: string) => `${msg} — disimpan sebagai potong manual dengan link lompat.`,
+    downloadAllDone: (ok: number, failed: number) =>
+      failed
+        ? `${ok} klip ke-export, ${failed} diblokir — lihat manual cut list.`
+        : `${ok} klip ke-export.`,
   }
 };

@@ -358,6 +358,19 @@ def normalize_youtube_url(url: str) -> str:
     return f"https://www.youtube.com/watch?v={vid}"
 
 
+def youtube_deep_link(video_id: str, start: float) -> str:
+    """Labeled jump link to the exact second of the source video.
+
+    Manual-fallback path: when YouTube refuses to hand over the media (403 /
+    PO-token / bot check) the automatic export dies, so the deliverable still
+    has to carry something the editor can act on. A `&t=<sec>s` link does:
+    open it, land on the window, cut it by hand.
+    """
+    if not video_id:
+        return ""
+    return f"https://www.youtube.com/watch?v={video_id}&t={int(max(0.0, start or 0.0))}s"
+
+
 def _walk_kind(node: _Node):
     """Yield ('li', node) and ('h', node) in document order."""
     for child in node.children:
@@ -699,6 +712,7 @@ def build_plan(
         it["index"] = i
         it["id"] = f"{it['video_id']}:{it['start']:.1f}-{it['end']:.1f}"
         it["timestamp"] = f"{_fmt(it['start'])} - {_fmt(it['end'])}"
+        it["youtube_url"] = youtube_deep_link(it["video_id"], it["start"])
         it["title"] = _default_title(it)
         it["caption"] = _default_caption(it, spec)
         it["hashtags"] = " ".join(_default_hashtags(it, spec))
@@ -818,6 +832,8 @@ def build_brief_md(spec: dict, plan: dict, copy_note: str = "") -> str:
     lines.append("")
     lines.append("Every window below is exported RAW (original quality, ±2s headroom) — trim frame-accurate in your editor.")
     lines.append("")
+    lines.append("If a source blocks the automatic download (YouTube 403 / bot check), every window still carries a **jump link** to the exact second: open it, cut by hand. Same links in the copy-per-clip section.")
+    lines.append("")
     current = None
     for item in plan.get("items", []):
         if item["video_id"] != current:
@@ -825,11 +841,12 @@ def build_brief_md(spec: dict, plan: dict, copy_note: str = "") -> str:
             lines.append(f"### {item.get('source_label')}")
             lines.append(f"Source: {item.get('source_url')}")
             lines.append("")
-            lines.append("| # | Window | Len | Section | Evidence | Title |")
-            lines.append("|---|--------|-----|---------|----------|-------|")
+            lines.append("| # | Window | Len | Section | Evidence | Title | Jump |")
+            lines.append("|---|--------|-----|---------|----------|-------|------|")
         lines.append(
             f"| {item['index'] + 1} | {item['timestamp']} | {item['duration']:.0f}s | "
-            f"{item.get('section_label') or ''} | {item['evidence']} | {item.get('title') or ''} |"
+            f"{item.get('section_label') or ''} | {item['evidence']} | {item.get('title') or ''} | "
+            f"[▶ open]({item.get('youtube_url') or item.get('source_url')}) |"
         )
     lines.append("")
     if plan.get("warnings"):
@@ -842,6 +859,8 @@ def build_brief_md(spec: dict, plan: dict, copy_note: str = "") -> str:
         lines.append("")
         lines.append(f"**{item['index'] + 1}. {item['timestamp']} — {item.get('title')}**")
         lines.append(f"- Source: {item.get('source_label')} ({item.get('source_url')})")
+        if item.get("youtube_url"):
+            lines.append(f"- Jump link: {item['youtube_url']}")
         lines.append(f"- Why: {item.get('reason')}")
         if item.get("caption"):
             lines.append(f"- Caption: {item['caption']}")
