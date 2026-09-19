@@ -291,6 +291,13 @@ export const en = {
       failed
         ? `${ok} clip(s) exported, ${failed} blocked — see the manual cut list.`
         : `${ok} clip(s) exported.`,
+    zipAll: "Zip all RAW",
+    zippingAll: (done: number, total: number) => `Zipping ${done}/${total}...`,
+    zipDone: (clips: number, blocked: number) =>
+      `Pack downloaded as ONE .zip — ${clips} clip(s) + BRIEF.md${blocked ? ` + MANUAL_CUTS.md (${blocked} blocked)` : ''}.`,
+    zipEmpty: "Nothing to zip — every window was blocked (see the manual cut list).",
+    zipTooBig: "Pack too big for a single archive (>1.5 GB) — download the clips individually.",
+    bulkHint: "“Download all” fires one download per clip: your browser may ask ONCE to allow multiple downloads (allow it, or use “Zip all” for a single file).",
   }
 };
 

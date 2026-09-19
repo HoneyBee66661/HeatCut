@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useLanguage } from './locales';
 import { fetchRawClip, safeFilename, saveBlob, youtubeLink } from './lib/rawExport';
+import { buildZip, zipEntry, type ZipEntry } from './lib/zipBundle';
 
 // ---------------------------------------------------------------- types
 
@@ -105,6 +106,9 @@ interface HistoryEntry {
 const HISTORY_KEY = 'heatcut_campaign_history';
 const URL_KEY = 'heatcut_campaign_url';
 
+/** One archive is one download — cap it so the tab never has to hold a huge pack. */
+const ZIP_MAX_BYTES = 1.5 * 1024 * 1024 * 1024;
+
 const fmt = (sec: number): string => {
   const s = Math.max(0, Math.floor(sec || 0));
   if (s < 3600) return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
@@ -140,6 +144,7 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
   const [aiCopy, setAiCopy] = useState(false);
   const [exportingKey, setExportingKey] = useState<string | null>(null);
   const [bulk, setBulk] = useState<{ done: number; total: number } | null>(null);
+  const [bulkZip, setBulkZip] = useState(false);
   // item id -> why the automatic download failed. Non-empty = that window is
   // handed over as a MANUAL cut (labeled jump link to the source second).
   const [manual, setManual] = useState<Record<string, string>>({});
@@ -361,6 +366,55 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
   const downloadManualList = () => {
     const md = manualListMd(manualItems.length ? manualItems : plan?.items || []);
     if (md) saveBlob(new Blob([md], { type: 'text/markdown' }), `heatcut_campaign_${plan?.campaign_id || 'manual'}_manual.md`);
+  };
+
+  // One archive = one download = no "allow multiple downloads" gate. Same fetch
+  // path as the per-clip button, plus BRIEF.md / MANUAL_CUTS.md riding along.
+  const downloadZipAll = async () => {
+    if (!plan || bulk || exportingKey) return;
+    const items = plan.items;
+    const entries: ZipEntry[] = [];
+    const blocked: PlanItem[] = [];
+    let bytes = 0;
+    setBulk({ done: 0, total: items.length });
+    setBulkZip(true);
+    for (let i = 0; i < items.length; i += 1) {
+      setBulk({ done: i, total: items.length });
+      try {
+        const blob = await fetchRawClip(items[i].video_id, items[i].start, items[i].end, items[i].source_label);
+        const entry = await zipEntry(
+          `heatcut_${safeFilename(items[i].source_label)}_${Math.floor(items[i].start)}-${Math.floor(items[i].end)}s.mp4`,
+          blob,
+        );
+        bytes += entry.size;
+        if (bytes > ZIP_MAX_BYTES) {
+          setBulk(null);
+          setBulkZip(false);
+          toast(c.zipTooBig, 8000);
+          return;
+        }
+        entries.push(entry);
+        clearManual(items[i].id);
+      } catch (err) {
+        markManual(items[i].id, err instanceof Error ? err.message : c.exportFailed);
+        blocked.push(items[i]);
+      }
+      await new Promise(r => setTimeout(r, 120));
+    }
+    if (!entries.length) {
+      setBulk(null);
+      setBulkZip(false);
+      toast(c.zipEmpty, 8000);
+      return;
+    }
+    entries.push(await zipEntry('BRIEF.md', new Blob([plan.brief_md], { type: 'text/markdown' })));
+    if (blocked.length) {
+      entries.push(await zipEntry('MANUAL_CUTS.md', new Blob([manualListMd(blocked)], { type: 'text/markdown' })));
+    }
+    saveBlob(buildZip(entries), `heatcut_campaign_${plan.campaign_id || 'pack'}_raw.zip`);
+    setBulk(null);
+    setBulkZip(false);
+    toast(c.zipDone(entries.filter(e => e.name.endsWith('.mp4')).length, blocked.length), 8000);
   };
 
   // ---------------------------------------------------------------- render help
@@ -685,11 +739,24 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                 style={{ padding: '0.45rem 1rem', fontSize: '0.78rem' }}
                 disabled={!plan.items.length || !!bulk || !!exportingKey}
                 onClick={downloadAll}
+                title={c.bulkHint}
               >
-                {bulk ? c.downloadingAll(bulk.done, bulk.total) : `⬇ ${c.downloadAll}`}
+                {bulk && !bulkZip ? c.downloadingAll(bulk.done, bulk.total) : `⬇ ${c.downloadAll}`}
+              </button>
+              <button
+                type="button"
+                className="glowing-btn"
+                style={{ padding: '0.45rem 1rem', fontSize: '0.78rem' }}
+                disabled={!plan.items.length || !!bulk || !!exportingKey}
+                onClick={downloadZipAll}
+                title={c.bulkHint}
+              >
+                {bulk && bulkZip ? c.zippingAll(bulk.done, bulk.total) : `🧩 ${c.zipAll}`}
               </button>
             </div>
           </div>
+
+          <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)' }}>{c.bulkHint}</p>
 
           {!!plan.warnings?.length && (
             <div style={{ padding: '0.65rem 0.85rem', borderRadius: 10, background: 'rgba(251, 191, 36, 0.07)', border: '1px solid rgba(251, 191, 36, 0.28)', fontSize: '0.8rem', color: '#fcd34d' }}>

@@ -293,5 +293,12 @@ export const id: Translations = {
       failed
         ? `${ok} klip ke-export, ${failed} diblokir — lihat manual cut list.`
         : `${ok} klip ke-export.`,
+    zipAll: "Zip semua RAW",
+    zippingAll: (done: number, total: number) => `Zip ${done}/${total}...`,
+    zipDone: (clips: number, blocked: number) =>
+      `Pack ke-download sebagai SATU .zip — ${clips} klip + BRIEF.md${blocked ? ` + MANUAL_CUTS.md (${blocked} diblokir)` : ''}.`,
+    zipEmpty: "Nggak ada yang bisa di-zip — semua window diblokir (lihat manual cut list).",
+    zipTooBig: "Pack kegedean buat satu arsip (>1.5 GB) — download klipnya satu-satu.",
+    bulkHint: "\"Download semua\" bikin satu unduhan per klip: browser bisa nanya SEKALI buat izinin multi-download (izinkan, atau pakai \"Zip semua\" yang cuma satu file).",
   }
 };
