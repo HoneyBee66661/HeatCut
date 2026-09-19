@@ -32,7 +32,7 @@ import tempfile
 import time
 import threading
 import uuid
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -650,6 +650,187 @@ def get_yt_cookiefile() -> Optional[str]:
     return p if os.path.exists(p) and os.path.getsize(p) > 0 else None
 
 
+# ------------------------------------------------------------------
+# Which player client actually SERVES MEDIA (not just extracts)
+# ------------------------------------------------------------------
+# Extraction succeeding is not proof the media is fetchable. Measured from this
+# host 2026-09-19 with a live logged-in jar + JS runtime + EJS: `default` and
+# `mweb` handed back signed URLs that 403 on the FIRST byte while `web_safari`
+# served the same window fine (range GET 206) — the miner AND the full-download
+# fallback died on those 403s even though `yt-dlp --simulate` looked perfect.
+# So the export PICKS a client by probing the URL, never by trusting extraction.
+# Order is overridable: HEATCUT_YT_EXPORT_CLIENTS="web_safari,default".
+DEFAULT_EXPORT_CLIENTS = "web_safari,default"
+
+
+def _yt_export_clients() -> List[str]:
+    raw = (os.environ.get("HEATCUT_YT_EXPORT_CLIENTS") or DEFAULT_EXPORT_CLIENTS).strip()
+    out = [c.strip() for c in raw.split(",") if c.strip()]
+    if "default" not in out:
+        out.append("default")  # keep the historical behaviour as the last resort
+    return out
+
+
+def _media_url_ok(fmt: dict, timeout: int = 20) -> bool:
+    """1 KB range GET on a format's media URL: is it actually served?
+
+    Uses the SAME client and `http_headers` as the miner
+    (`_download_fmp4_window`) so the probe can never pass where the real fetch
+    would fail.
+    """
+    import requests as _rq
+    url = (fmt or {}).get("url")
+    if not url:
+        return False
+    try:
+        r = _rq.get(url, headers={**(fmt.get("http_headers") or {}), "Range": "bytes=0-1023"},
+                    timeout=timeout)
+        return r.status_code in (200, 206)
+    except Exception:  # noqa: BLE001 — any refusal/error means "not usable"
+        return False
+
+
+def _miner_pick_pair(formats: List[dict]) -> Tuple[Any, Any]:
+    """The (video, audio) DASH pair the fragment miner will cut (height<=1080)."""
+    vfmt, v_h = None, -1
+    for f in formats or []:
+        if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
+                and f.get("protocol") == "https" and f.get("ext") == "mp4"
+                and f.get("url") and 0 < (f.get("height") or 0) <= 1080
+                and (f.get("height") or 0) > v_h):
+            vfmt, v_h = f, f.get("height") or 0
+    afmt, a_b = None, -1.0
+    for f in formats or []:
+        if (f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+                and f.get("protocol") == "https" and f.get("ext") in ("m4a", "mp4")
+                and f.get("url") and (f.get("tbr") or f.get("abr") or 0) > a_b):
+            afmt, a_b = f, f.get("tbr") or f.get("abr") or 0
+    return vfmt, afmt
+
+
+def _pick_hls_pair(formats: List[dict]) -> Tuple[Any, Any]:
+    """Best m3u8 (HLS) video+audio pair — the fallback when DASH URLs 403."""
+    vfmt, v_h = None, -1
+    for f in formats or []:
+        if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
+                and "m3u8" in str(f.get("protocol") or "") and f.get("url")
+                and 0 < (f.get("height") or 0) <= 1080 and (f.get("height") or 0) > v_h):
+            vfmt, v_h = f, f.get("height") or 0
+    afmt, a_b = None, -1.0
+    for f in formats or []:
+        if (f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+                and "m3u8" in str(f.get("protocol") or "") and f.get("url")
+                and (f.get("tbr") or f.get("abr") or 0) > a_b):
+            afmt, a_b = f, f.get("tbr") or f.get("abr") or 0
+    return vfmt, afmt
+
+
+def _probe_candidates(fmts: List[dict], mode: str, limit: int = 5) -> List[dict]:
+    """Best-first candidate formats for one probe pass.
+
+    mode: "video" (video-only), "audio" (audio-only) or "muxed" (BOTH codecs in
+    ONE URL — HLS manifests like itag 91-96 and progressive 18/22). The muxed
+    pass matters: on a DASH-refused video the only servable formats are muxed,
+    so a video-only filter finds nothing and the export wrongly reports
+    "no servable media pair".
+    """
+    out: List[dict] = []
+    for f in fmts or []:
+        if not f.get("url"):
+            continue
+        v = f.get("vcodec") not in (None, "none")
+        a = f.get("acodec") not in (None, "none")
+        if mode == "video" and not (v and not a):
+            continue
+        if mode == "audio" and not (a and not v):
+            continue
+        if mode == "muxed" and not (v and a):
+            continue
+        if mode in ("video", "muxed") and not 0 < (f.get("height") or 0) <= 1080:
+            continue
+        out.append(f)
+    out.sort(key=lambda x: ((x.get("tbr") or x.get("abr") or 0) if mode == "audio"
+                            else (x.get("height") or 0)), reverse=True)
+    return out[:limit]
+
+
+def _servable_pair(formats: List[dict]) -> Any:
+    """Plan for the format/pair whose URLs actually SERVE BYTES (None if none).
+
+    {"kind": "dash"|"hls"|"muxed"|"other", "format": "<vid>+<aid>"|"<id>",
+     "height": int|None}
+
+    Probes the real URLs best-first instead of assuming a DASH pair works.
+    Measured 2026-09-19 on a label-owned video with a live jar: every DASH mp4 id
+    (399/137/18) answered 403 on the first byte while `web_safari`'s MUXED HLS 96
+    served bytes (206).
+    Order: (1) range-able https-DASH video+audio pair — the only thing the
+    fragment miner can cut; (2) one MUXED format (single URL, download + cut);
+    (3) any servable video plus any servable audio (mixed protocols are fine,
+    yt-dlp + ffmpeg merge them). "kind" == "dash" is the miner's gate.
+    """
+    vfmt, afmt = _miner_pick_pair(formats)
+    if vfmt and afmt and _media_url_ok(vfmt) and _media_url_ok(afmt):
+        return {"kind": "dash", "format": f"{vfmt.get('format_id')}+{afmt.get('format_id')}",
+                "height": vfmt.get("height")}
+    for f in _probe_candidates(formats, "muxed"):
+        if _media_url_ok(f):
+            kind = "hls" if "m3u8" in str(f.get("protocol") or "") else "muxed"
+            return {"kind": kind, "format": str(f.get("format_id")), "height": f.get("height")}
+    v = next((f for f in _probe_candidates(formats, "video") if _media_url_ok(f)), None)
+    if v is not None:
+        a = next((f for f in _probe_candidates(formats, "audio") if _media_url_ok(f)), None)
+        if a is not None:
+            proto = f"{v.get('protocol') or ''} {a.get('protocol') or ''}"
+            return {"kind": "hls" if "m3u8" in proto else "other",
+                    "format": f"{v.get('format_id')}+{a.get('format_id')}",
+                    "height": v.get("height")}
+    return None
+
+
+def _extract_info_for_export(url: str) -> Tuple[Any, Any, Any]:
+    """Extract, preferring a client whose media URLs are actually served.
+
+    Returns (info, client, plan) where `client` is the name to pin via
+    extractor_args (None = default) and `plan` is None or
+    {"kind": "dash"|"hls", "format": "<vid>+<aid>"}. Walks
+    _yt_export_clients(), probing the real URLs with a 1 KB range GET and
+    stopping at the first client+pair that serves bytes. When nothing serves,
+    the last successful extraction is returned with plan=None so the caller
+    reports the real downstream error instead of a probe message.
+    """
+    import yt_dlp
+
+    last = None
+    for name in _yt_export_clients():
+        opts: Any = {
+            "quiet": True, "no_warnings": True, "noprogress": True,
+            "socket_timeout": 15, "retries": 2,
+            **( {"cookiefile": _cf} if (_cf := get_yt_cookiefile()) else {} ),
+            **_yt_env_opts(),
+        }
+        if name and name != "default":
+            opts["extractor_args"] = {"youtube": {"player_client": [name]}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:  # noqa: BLE001 — try the next client
+            logger.info(f"[export] player_client={name}: extraction failed ({str(e)[:110]})")
+            continue
+        pinned = None if (not name or name == "default") else name
+        if last is None:
+            last = (info, pinned, None)
+        plan = _servable_pair((info or {}).get("formats") or [])
+        if plan:
+            logger.info(f"[export] using player_client={name} / {plan['kind']} {plan['format']} "
+                        f"({plan.get('height')}p) - URLs serve bytes")
+            return info, pinned, plan
+        logger.warning(f"[export] player_client={name}: no servable media pair — next client")
+    if last is None:
+        raise ValueError("no player client could extract this video")
+    return last
+
+
 def _yt_env_opts() -> dict:
     """yt-dlp options for the YouTube JS-challenge (n-sig/EJS) era.
 
@@ -759,7 +940,7 @@ def fetch_video_metadata(url: str):
             'no_warnings': True,
             'nocheckcertificate': True,
             'socket_timeout': 10,
-            'extractor_args': {'youtube': ['player_client=tv,android']},
+            'extractor_args': {'youtube': {'player_client': ['tv', 'android']}},
         }
         cf = get_yt_cookiefile()
         if cf:
@@ -1556,35 +1737,26 @@ def _first_pts(path: str, stream: int) -> float | None:
     return None
 
 
-def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) -> str:
-    """Try a partial (fragment-range) export; raise on any failure."""
+def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float,
+                       info: Any = None) -> str:
+    """Try a partial (fragment-range) export; raise on any failure.
+
+    `info` normally comes from `_extract_info_for_export`, which already picked a
+    client whose media URLs serve bytes — reusing it keeps the miner's URLs and
+    the full-download fallback's client consistent.
+    """
     import yt_dlp  # lazy: heavy scraping package
 
-    with yt_dlp.YoutubeDL({
-        "quiet": True, "no_warnings": True, "noprogress": True,
-        "socket_timeout": 15, "retries": 2,
-        **({"cookiefile": _cf} if (_cf := get_yt_cookiefile()) else {}),
-        **_yt_env_opts(),
-    }) as ydl:
-        info = ydl.extract_info(url, download=False)
+    if info is None:
+        with yt_dlp.YoutubeDL({
+            "quiet": True, "no_warnings": True, "noprogress": True,
+            "socket_timeout": 15, "retries": 2,
+            **( {"cookiefile": _cf} if (_cf := get_yt_cookiefile()) else {} ),
+            **_yt_env_opts(),
+        }) as ydl:
+            info = ydl.extract_info(url, download=False)
     formats = (info or {}).get("formats") or []
-    vfmt = None
-    v_h = -1
-    for f in formats:
-        if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
-                and f.get("protocol") == "https" and f.get("ext") == "mp4"
-                and f.get("url") and 0 < (f.get("height") or 0) <= 1080
-                and (f.get("height") or 0) > v_h):
-            vfmt = f
-            v_h = f.get("height") or 0
-    afmt = None
-    a_b = -1.0
-    for f in formats:
-        if (f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
-                and f.get("protocol") == "https" and f.get("ext") in ("m4a", "mp4")
-                and f.get("url") and (f.get("tbr") or f.get("abr") or 0) > a_b):
-            afmt = f
-            a_b = f.get("tbr") or f.get("abr") or 0
+    vfmt, afmt = _miner_pick_pair(formats)
     if not vfmt or not afmt:
         raise ValueError("no https DASH video+audio pair with sidx")
     if not (vfmt.get("height") or 0) >= 360:
@@ -3097,14 +3269,31 @@ async def export_clip(request: ExportRequest):
         dur = cut_end - cut_start
         out_mp4 = os.path.join(tmpdir, "clip.mp4")
 
+        # ── Which client serves the media? ───────────────────────────────
+        # Extraction success is NOT enough: with a live jar the default client
+        # can return signed URLs that 403 on the first byte (web_safari served
+        # the same window). Probe before spending a download on them, and reuse
+        # the extraction for the miner so both paths use the SAME client.
+        info = None
+        client = None
+        plan = None
+        try:
+            info, client, plan = _extract_info_for_export(url)
+        except Exception as e:  # noqa: BLE001 — the miner/legacy path will report
+            logger.warning(f"[export] client probe failed ({str(e)[:120]}) — using defaults")
+
         # ── Fast path: DASH fragment-range miner ─────────────────────────
         # True partial transfer: fetch only the fragments overlapping the
         # padded clip window (see _frag_miner_export). Falls back silently
         # to the full download below on ANY failure (no sidx, odd codecs,
         # bot-check, ffmpeg hiccup, ...). Wasted bytes on failure ≈ the
         # window slice only — never a second full download.
+        # Skipped outright when the probe only found an HLS pair: mining needs a
+        # single range-able DASH file, so trying would just burn a request.
         try:
-            mined = _frag_miner_export(url, tmpdir, cut_start, cut_end)
+            if plan and plan.get("kind") != "dash":
+                raise ValueError(f"only {plan.get('kind')} media served — fragment miner not applicable")
+            mined = _frag_miner_export(url, tmpdir, cut_start, cut_end, info=info)
             probe = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                  "-of", "csv=p=0", mined],
@@ -3143,24 +3332,58 @@ async def export_clip(request: ExportRequest):
         if cf:
             dl_opts["cookiefile"] = cf
         dl_opts.update(_yt_env_opts())
+        if plan and plan.get("format"):
+            # Download the pair the probe proved to be served. Without this pin
+            # yt-dlp re-selects by quality/codec preference and lands back on the
+            # 403'ing DASH format (measured: av01 399 preferred over HLS 96).
+            dl_opts["format"] = plan["format"]
+            logger.info(f"[export] full download pinned to format {plan['format']} ({plan.get('kind')})")
 
         def _do_download(opts: Any) -> None:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
 
-        try:
-            _do_download(dl_opts)
-        except Exception as e:
-            if _botcheck_message(e):
-                # Bot-check on the default web client — retry once with the
-                # tv/android player client (often exempt, no login needed).
-                logger.warning("Export hit YouTube bot-check — retrying with tv/android player client.")
-                _do_download({
-                    **dl_opts,
-                    "extractor_args": {"youtube": ["player_client=tv,android"]},
-                })
-            else:
-                raise
+        # Ladder: the pinned client first, then the rest. A refused media URL
+        # ("HTTP Error 403" while downloading the data) is NOT a bot-check
+        # string, so the old tv/android retry never fired for it — this loop is
+        # what actually recovers from a 403'd media URL.
+        attempts: List[Any] = [client] if client else ["default"]
+        for c in _yt_export_clients():
+            if c not in attempts:
+                attempts.append(c)
+
+        last_err: Any = None
+        for idx, name in enumerate(attempts):
+            attempt: Any = dict(dl_opts)
+            if idx:
+                # A pinned format_id belongs to ONE client's format list — drop it
+                # so a later client re-selects instead of failing on the id.
+                attempt.pop("format", None)
+                if plan and plan.get("kind") == "hls":
+                    attempt["format"] = "bv*[protocol^=m3u8]+ba/b[protocol^=m3u8]/b"
+            if name and name != "default":
+                attempt["extractor_args"] = {"youtube": {"player_client": [name]}}
+            try:
+                _do_download(attempt)
+                last_err = None
+                break
+            except Exception as e:  # noqa: BLE001 — try the next client
+                last_err = e
+                if _botcheck_message(e):
+                    # Bot-check on this client — retry with the login-less
+                    # tv/android pair before moving down the ladder.
+                    logger.warning("Export hit YouTube bot-check — retrying with tv/android player client.")
+                    try:
+                        _do_download({**attempt, "extractor_args": {"youtube": {"player_client": ["tv", "android"]}}})
+                        last_err = None
+                        break
+                    except Exception as e2:  # noqa: BLE001
+                        last_err = e2
+                logger.warning(f"[export] full download via player_client={name or 'default'} "
+                               f"failed ({str(last_err)[:120]})")
+                _clear_export_artifacts(tmpdir)
+        if last_err is not None:
+            raise last_err
         src = None
         for f in sorted(os.listdir(tmpdir)):
             if f.startswith("src."):
