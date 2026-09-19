@@ -1911,27 +1911,36 @@ def list_available_models(api_key: str = ""):
         logger.error(f"Error listing models: {e}")
         return {"models": default_models}
 
-def _provider_llm_call(provider: str, model: str, prompt: str, api_key: str, base_url: Optional[str] = None) -> str:
+def _provider_llm_call(provider: str, model: str, prompt: str, api_key: str,
+                       base_url: Optional[str] = None,
+                       json_instruction: Optional[str] = None,
+                       system: Optional[str] = None) -> str:
     """Calls a non-Gemini LLM provider and returns raw text for JSON parsing.
 
     provider: 'openai' | 'anthropic' | 'openai-compatible'
     OpenAI-compatible base URL must include the API root, e.g.
     https://api.openai.com/v1 or https://api.deepseek.com/v1. This one path
     covers OpenAI, DeepSeek, OpenRouter, Groq, Ollama proxies, etc.
+
+    ``json_instruction``/``system`` override the analyze-schema defaults so the
+    same transport can serve other JSON contracts (e.g. the campaign copy pass);
+    callers that pass nothing keep the original analyze behaviour.
     """
     import requests as _rq
 
     if not api_key:
         raise ValueError(f"API key required for provider '{provider}' (set it in the app's AI Settings or via {provider.upper()}_API_KEY env).")
 
-    json_instruction = (
-        "\n\nRespond with ONLY a single JSON object, no markdown, no commentary:\n"
-        '{"summary": "1-2 sentence summary with 2-4 hashtags", '
-        '"clips": [{"title": "catchy max 8 words", "start_time": float, '
-        '"end_time": float, "hook_time": float, "virality_score": 1-100, '
-        '"key_quotes": ["quote"], "title_suggestion": "", '
-        '"caption_suggestion": "", "hashtag_suggestion": ""}]}'
-    )
+    if json_instruction is None:
+        json_instruction = (
+            "\n\nRespond with ONLY a single JSON object, no markdown, no commentary:\n"
+            '{"summary": "1-2 sentence summary with 2-4 hashtags", '
+            '"clips": [{"title": "catchy max 8 words", "start_time": float, '
+            '"end_time": float, "hook_time": float, "virality_score": 1-100, '
+            '"key_quotes": ["quote"], "title_suggestion": "", '
+            '"caption_suggestion": "", "hashtag_suggestion": ""}]}'
+        )
+    system = system or "You are a precise viral video clip finder. You always return valid JSON matching the requested schema exactly."
     user_content = prompt + json_instruction
 
     if provider == "anthropic":
@@ -1945,7 +1954,7 @@ def _provider_llm_call(provider: str, model: str, prompt: str, api_key: str, bas
             "model": model,
             "max_tokens": 8192,
             "temperature": 0.2,
-            "system": "You are a precise viral video clip finder. You always return valid JSON matching the requested schema exactly.",
+            "system": system,
             "messages": [{"role": "user", "content": user_content}],
         }
     else:
@@ -1959,7 +1968,7 @@ def _provider_llm_call(provider: str, model: str, prompt: str, api_key: str, bas
             "model": model,
             "temperature": 0.2,
             "messages": [
-                {"role": "system", "content": "You are a precise viral video clip finder. You always return valid JSON matching the requested schema exactly."},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
         }
@@ -3197,4 +3206,227 @@ async def export_clip(request: ExportRequest):
         # _finish_export_job then stops it and removes the workspace.
         background=BackgroundTask(_finish_export_job, tmpdir),
     )
+
+
+# ----------------------------------------------------------------
+# Campaign prep (Spade): paste a campaign link -> raw cut list
+# ----------------------------------------------------------------
+# The user's job on this app is POST-production: give them the raw material a
+# paid clipping campaign asks for, in one pass. Parsing and window planning are
+# fully deterministic (0 tokens); the LLM only ever writes copy, and only when
+# a key is supplied. Sources that carry campaign timestamps never touch the
+# network at all — that is the "cutting the inference load" path.
+try:  # uvicorn backend.main:app (repo root on sys.path) vs Vercel (backend/ on path)
+    from backend import campaign as campaign_mod
+except ImportError:  # pragma: no cover
+    import campaign as campaign_mod  # type: ignore
+
+CAMPAIGN_RATE_LIMIT = int(os.environ.get("HEATCUT_CAMPAIGN_RATE_LIMIT", "60"))  # per IP per hour
+CAMPAIGN_RATE_WINDOW = 3600.0
+
+
+class CampaignParseRequest(BaseModel):
+    url: str = Field(..., description="Spade campaign link (or bare campaign id)")
+
+
+class CampaignPrepRequest(BaseModel):
+    spec: dict = Field(..., description="Parsed campaign spec from /api/campaign/parse")
+    source_urls: Optional[List[str]] = Field(default=None, description="Selected source links (default: every source in the brief)")
+    target_duration: float = Field(30.0, description="Target clip length in seconds")
+    per_source: int = Field(6, description="Max raw windows per source")
+    max_clips: Optional[int] = Field(None, description="Hard cap (defaults to the campaign's max posts per creator)")
+    allow_network: bool = Field(True, description="Allow metadata/heatmap fetches for sources without timestamps")
+    generate_copy: bool = Field(False, description="Run the optional LLM copy pass (needs api_key)")
+    api_key: Optional[str] = None
+    provider: Optional[str] = Field(default="gemini", description="'gemini', 'openai', 'anthropic' or 'openai-compatible'")
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+_CAMPAIGN_COPY_INSTRUCTION = (
+    "\n\nFor EVERY clip index above return short-form copy:\n"
+    "- title: max 8 words, curious and positive, no clickbait the rules forbid\n"
+    "- caption: 1-2 sentences for TikTok/Reels, positive & mindful, mentions the source moment\n"
+    "- hashtags: 3-6 lowercase hashtags, space separated\n\n"
+    'Return ONLY JSON: {"clips": [{"index": int, "title": "...", "caption": "...", "hashtags": "#a #b"}]}'
+)
+
+
+def _campaign_copy_prompt(spec: dict, chunk: List[dict]) -> str:
+    req = spec.get("requirements") or {}
+    rules = req.get("rules") or []
+    head = [
+        "You are the post-production copy assistant for a PAID clipping campaign.",
+        f"Campaign: {spec.get('public_name') or spec.get('name')}",
+        f"Platforms: {', '.join(req.get('platforms') or []) or 'unknown'}",
+        f"Source video: {chunk[0].get('source_label')} — {chunk[0].get('source_url')}",
+    ]
+    if req.get("min_duration_sec"):
+        head.append(f"Minimum clip length: {req['min_duration_sec']:.0f}s")
+    if rules:
+        head.append("Campaign rules the copy MUST never violate:")
+        head.extend(f"- {r[:280]}" for r in rules[:6])
+    head.append("")
+    head.append("Raw clip windows already cut from that source (index|section|window|length|evidence):")
+    head.extend(
+        f"{it['index']}|{it.get('section_label') or '-'}|{it['timestamp']}|{it['duration']:.0f}s|{it['evidence']}"
+        for it in chunk
+    )
+    return "\n".join(head)
+
+
+def _campaign_copy_call(provider: str, model: str, prompt: str, api_key: str,
+                        base_url: Optional[str]) -> str:
+    if provider == "gemini":
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt + _CAMPAIGN_COPY_INSTRUCTION,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.5),
+        )
+        return resp.text or ""
+    return _provider_llm_call(
+        provider, model, prompt, api_key, base_url,
+        json_instruction=_CAMPAIGN_COPY_INSTRUCTION,
+        system="You write short-form clip copy that always obeys the campaign's brand-safety rules.",
+    )
+
+
+def _campaign_copy_pass(items: List[dict], spec: dict, provider: str, model: str,
+                        api_key: str, base_url: Optional[str]) -> tuple:
+    """Rewrite titles/captions/hashtags per source. Best effort: any failure
+    keeps the deterministic copy, so the cut list is never lost to a bad key."""
+    by_source: dict = {}
+    for it in items:
+        by_source.setdefault(it["video_id"], []).append(it)
+
+    applied = 0
+    for group in by_source.values():
+        for i in range(0, len(group), 10):
+            chunk = group[i:i + 10]
+            raw = _campaign_copy_call(provider, model, _campaign_copy_prompt(spec, chunk),
+                                      api_key, base_url)
+            parsed = _parse_json_response(raw) or {}
+            for entry in parsed.get("clips", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    idx = int(entry.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                target = next((x for x in chunk if x["index"] == idx), None)
+                if target is None:
+                    continue
+                if entry.get("title"):
+                    target["title"] = str(entry["title"]).strip()[:120]
+                if entry.get("caption"):
+                    target["caption"] = lowercase_hashtags_in_string(str(entry["caption"]).strip()[:600])
+                if entry.get("hashtags"):
+                    target["hashtags"] = lowercase_hashtags_in_string(str(entry["hashtags"]).strip()[:240])
+                applied += 1
+    return applied, model
+
+
+def _campaign_peaks(heatmap: list, duration: float, target_secs: float, count: int) -> List[dict]:
+    """Adapter so campaign.build_plan can mine retention peaks without importing
+    this module (dependency injection keeps backend/campaign.py stdlib-only)."""
+    return _heatmap_peaks(heatmap, duration, target_secs, count)
+
+
+@app.post("/api/campaign/parse")
+async def campaign_parse(request: CampaignParseRequest, http_request: Request):
+    """Read a Spade campaign link and return the structured brief: rate,
+    platforms, payout minimums, source content — with the timestamps each
+    source carries and the campaign's hard rules. No LLM, no key needed."""
+    ip = _client_ip(http_request)
+    if _rate_limited(f"campaign:{ip}", CAMPAIGN_RATE_LIMIT, CAMPAIGN_RATE_WINDOW):
+        raise HTTPException(status_code=429, detail=(
+            f"Batas pemakaian: maks {CAMPAIGN_RATE_LIMIT} campaign fetch per jam dari IP ini."
+        ))
+    try:
+        spec = await asyncio.to_thread(campaign_mod.parse_campaign, request.url)
+    except campaign_mod.CampaignError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Campaign parse failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Campaign parse failed: {e}")
+    logger.info(
+        "Campaign %s parsed: %d source(s), %d timestamped section(s), min %.0fs",
+        spec.get("campaign_id"), len(spec.get("sources") or []),
+        sum(len(s.get("timestamps") or []) for s in spec.get("sources") or []),
+        float((spec.get("requirements") or {}).get("min_duration_sec") or 0),
+    )
+    return spec
+
+
+@app.post("/api/campaign/prep")
+async def campaign_prep(request: CampaignPrepRequest):
+    """Turn the parsed brief into the RAW MATERIAL: a cut list of clip windows
+    (campaign timestamps sliced to length, retention peaks mined when a source
+    has none) plus title/caption/hashtag copy and a markdown brief."""
+    spec = request.spec or {}
+    sources = spec.get("sources") or []
+    if not spec.get("campaign_id") and not sources:
+        raise HTTPException(status_code=400, detail="No campaign spec supplied — parse the campaign link first.")
+
+    urls = request.source_urls or [s.get("url") for s in sources if s.get("url")]
+    if not urls:
+        raise HTTPException(status_code=400, detail="No source content selected for this campaign.")
+
+    try:
+        cap_default = int(spec.get("max_posts_per_user") or 15)
+    except (TypeError, ValueError):
+        cap_default = 15
+    max_clips = int(request.max_clips) if request.max_clips else cap_default
+    per_source = max(1, min(int(request.per_source or 6), 30))
+
+    try:
+        plan = await asyncio.to_thread(
+            campaign_mod.build_plan,
+            spec,
+            urls,
+            float(request.target_duration or 30.0),
+            per_source,
+            max_clips,
+            fetch_video_metadata,
+            _campaign_peaks,
+            request.allow_network,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Campaign prep failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Campaign prep failed: {e}")
+
+    copy_note = ""
+    copy_model = None
+    if request.generate_copy and plan.get("items"):
+        provider = (request.provider or "gemini").strip().lower()
+        prov_env = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+                    "anthropic": "ANTHROPIC_API_KEY",
+                    "openai-compatible": "OPENAI_API_KEY"}.get(provider, "GEMINI_API_KEY")
+        key = (request.api_key or os.environ.get(prov_env) or "").strip()
+        model = (request.model or "gemini-2.5-flash").strip()
+        if not key or key.lower() == "mock":
+            copy_note = "Copy pass skipped: no API key was supplied — deterministic titles kept."
+        else:
+            try:
+                applied, copy_model = await asyncio.wait_for(
+                    asyncio.to_thread(_campaign_copy_pass, plan["items"], spec, provider, model, key,
+                                      request.base_url), timeout=180)
+                copy_note = f"AI copy applied to {applied} window(s) with {copy_model}."
+                if applied == 0:
+                    copy_note = "AI copy pass returned nothing usable — deterministic titles kept."
+            except Exception as e:  # noqa: BLE001 — copy is an upgrade, never a hard failure
+                logger.info(f"Campaign copy pass skipped ({str(e)[:140]})")
+                copy_note = f"Copy pass failed ({str(e)[:120]}) — deterministic titles kept."
+
+    plan["campaign_id"] = spec.get("campaign_id")
+    plan["campaign_name"] = spec.get("public_name") or spec.get("name")
+    plan["copy_note"] = copy_note
+    plan["copy_model"] = copy_model
+    plan["brief_md"] = campaign_mod.build_brief_md(spec, plan, copy_note)
+    logger.info(
+        "Campaign %s prepped: %d window(s) from %d source(s) (%s)",
+        spec.get("campaign_id"), len(plan.get("items") or []), len(urls), copy_note or "no copy pass",
+    )
+    return plan
 

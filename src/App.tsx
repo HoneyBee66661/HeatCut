@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { HeatmapTimeline } from './components/HeatmapTimeline';
 import { LanguageSwitcher } from './components/LanguageSwitcher';
+import CampaignPage from './CampaignPage';
 import { useLanguage } from './locales';
 import type { AnalyzeResponse, ViralClip } from './types';
 
@@ -71,6 +72,9 @@ const MODEL_PRESETS: Record<string, string[]> = {
 
 export default function App() {
   const { t } = useLanguage();
+  // Two screens in one app: the YouTube hotspot studio, and the campaign-prep
+  // page (paste a clipping-campaign link -> raw material for post-production).
+  const [view, setView] = useState<'studio' | 'campaign'>('studio');
   const [url, setUrl] = useState('');
   const [durationPref, setDurationPref] = useState<'15s' | '30s' | '60s'>('30s');
   const [sourceMode, setSourceMode] = useState<'auto' | 'podcast' | 'concert'>('auto');
@@ -1483,6 +1487,24 @@ Transcript:
         </div>
         <div className="header-nav" style={{ display: 'flex', alignItems: 'center', gap: '0.85rem' }}>
           <LanguageSwitcher />
+          <button
+            type="button"
+            className="glowing-btn"
+            onClick={() => setView(prev => (prev === 'campaign' ? 'studio' : 'campaign'))}
+            title={view === 'campaign' ? t.header.backToStudio : t.campaign.subtitle}
+            style={{
+              padding: '0.5rem 1rem',
+              fontSize: '0.8rem',
+              borderRadius: '8px',
+              border: '1px solid rgba(255, 94, 58, 0.45)',
+              background: view === 'campaign' ? 'rgba(255, 94, 58, 0.16)' : 'rgba(255, 255, 255, 0.04)',
+              color: 'var(--text-primary)',
+              cursor: 'pointer',
+              boxShadow: 'none',
+            }}
+          >
+            {view === 'campaign' ? `↩ ${t.header.backToStudio}` : `🎯 ${t.header.campaignNav}`}
+          </button>
           <a
             href="https://tako.id/johansa"
             target="_blank"
@@ -1502,6 +1524,16 @@ Transcript:
         </div>
       </header>
 
+      {view === 'campaign' ? (
+        <CampaignPage
+          apiKey={apiKey}
+          provider={aiProvider}
+          model={selectedModel}
+          baseUrl={aiBaseUrl}
+          onToast={setToastMessage}
+        />
+      ) : (
+      <>
       {/* Main Form controls panel */}
       <section className="glass-panel" style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
         <form onSubmit={handleAnalyze} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -3220,6 +3252,8 @@ Transcript:
             </div>
           </div>
         </main>
+      )}
+      </>
       )}
 
       {/* Global CSS spinner keyframe animation injection */}

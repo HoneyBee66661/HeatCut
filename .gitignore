@@ -60,6 +60,10 @@ eggs/
 .eggs/
 lib/
 lib64/
+# …but these rules target Python build artifacts, and a bare `lib/` also
+# swallows the frontend's own src/lib (see src/lib/rawExport.ts). Keep it.
+!src/lib/
+!src/lib/**
 parts/
 sdist/
 var/
