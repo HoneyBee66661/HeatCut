@@ -8,7 +8,11 @@
 .worker.env
 !.env.template
 !.env.example
-backend/yt_cookies.txt
+# yt-dlp Netscape cookie jars — account session secrets, never commit:
+# basename rule covers both the worker jar (./yt_cookies.txt) and the backend's
+# (backend/yt_cookies.txt). A stray jar in either place would otherwise be
+# picked up by `git add -A`.
+yt_cookies.txt
 
 # ─── NODE / FRONTEND ─────────────────────────────────────────
 node_modules/
