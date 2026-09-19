@@ -580,7 +580,16 @@ def _fmp4_sidx(buf: bytes):
     raise ValueError("no sidx box in fMP4 header")
 
 
-def _download_fmp4_window(fmt: dict, t0: float, t1: float) -> bytes:
+def _download_fmp4_window(fmt: dict, t0: float, t1: float) -> tuple:
+    """Partial download of one DASH stream; returns (bytes, content_begin, content_end).
+
+    The byte range covers the fragments a fragment-boundary-aligned SUPERSET of
+    [t0, t1], and the sidx already tells us the exact content times of those
+    boundaries, so we return them: the caller needs them to align video against
+    audio (the two streams are cut at their OWN boundaries, which differ by up
+    to one fragment — merging as-is bakes in an A/V offset, and `-itsoffset`
+    canNOT fix that, see `_frag_miner_export`).
+    """
     import requests as _rq
     headers = dict(fmt.get("http_headers") or {})
     head = _rq.get(fmt["url"], headers={**headers, "Range": "bytes=0-131071"}, timeout=60)
@@ -629,7 +638,7 @@ def _download_fmp4_window(fmt: dict, t0: float, t1: float) -> bytes:
     media = rng.content
     if len(media) < total * 0.9:
         raise ValueError(f"short range read ({len(media)}/{total})")
-    return init + media
+    return init + media, bounds[i0] / ts, bounds[i1 + 1] / ts
 
 
 def _extract_info_yt(url: str) -> dict:
@@ -650,26 +659,40 @@ def _extract_info_yt(url: str) -> dict:
 
 
 def _first_pts(path: str, stream: int) -> float | None:
-    """First packet PTS of a stream (content time of the first fragment).
+    """First packet PTS of a stream (content time of the first sample).
 
-    The miner cuts video and audio DASH streams at their OWN fragment
-    boundaries, so the two can start at different content times (up to one
-    fragment apart) — merging as-is bakes in an A/V offset (audio ahead by
-    ~1s was reported). This returns the anchor used to resync via -itsoffset.
+    Diagnostic only now (the miner gets its anchors from the sidx, not from
+    this). Two traps learned the hard way:
+      * `-of csv=p=0` can emit a TRAILING COMMA ("19.969161,") — a bare
+        `float(line)` throws ValueError, the whole probe returned None and the
+        resync silently never ran (that is exactly how a 3.9 s A/V offset
+        shipped): always take the first CSV field.
+      * `-read_intervals "%+#1"` returns nothing for some audio-only fMP4
+        parts, so fall back to reading the first packet of the whole file.
     """
     spec = "v:0" if stream == 0 else "a:0"
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", spec,
-             "-show_entries", "packet=pts_time", "-of", "csv=p=0",
-             "-read_intervals", "%+#1", path],
-            capture_output=True, text=True, timeout=60)
-        for line in out.stdout.strip().splitlines():
-            line = line.strip()
-            if line and line.lower() != "n/a":
-                return float(line)
-    except (ValueError, subprocess.SubprocessError, OSError):
-        pass
+    attempts = (
+        ["-read_intervals", "%+#1"],   # cheap, but fails on some audio parts
+        [],                            # full scan fallback (bounded by the walk)
+    )
+    for extra in attempts:
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", spec,
+                 "-show_entries", "packet=pts_time", "-of", "csv=p=0", *extra, path],
+                capture_output=True, text=True, timeout=60)
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in out.stdout.splitlines():
+            field = line.split(",")[0].strip()
+            if field and field.lower() != "n/a":
+                try:
+                    return float(field)
+                except ValueError:
+                    break  # malformed line: try the next strategy
+        if extra:
+            continue  # first packet of the file is fine even without intervals
+        break
     return None
 
 
@@ -697,28 +720,58 @@ def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) 
         raise ValueError("no https DASH video+audio pair with sidx")
     v_fmp4 = os.path.join(tmpdir, "v_part.mp4")
     a_fmp4 = os.path.join(tmpdir, "a_part.m4a")
+    a_trim = os.path.join(tmpdir, "a_trim.m4a")
+    v_bytes, v_begin, v_end = _download_fmp4_window(vfmt, cut_start, cut_end)
     with open(v_fmp4, "wb") as fh:
-        fh.write(_download_fmp4_window(vfmt, cut_start, cut_end))
+        fh.write(v_bytes)
+    # Anchor the clip on the VIDEO: its start must be a keyframe (fragment
+    # boundary), so it is the only stream we can cut without re-encoding.
+    # Fetch audio from a boundary at or BEFORE that anchor (the sidx pulls the
+    # boundary <= the requested time, so asking for min(cut_start, v_begin)
+    # guarantees audio_begin <= v_begin), then trim the audio lead-in and tail
+    # to match the video span exactly.
+    a_req = min(cut_start, v_begin)
+    a_bytes, a_begin, a_end = _download_fmp4_window(afmt, a_req, cut_end)
     with open(a_fmp4, "wb") as fh:
-        fh.write(_download_fmp4_window(afmt, cut_start, cut_end))
+        fh.write(a_bytes)
+
+    lead = v_begin - a_begin          # >= 0 by construction
+    span = v_end - v_begin
+    a_src = a_fmp4
+    if lead > 0.005 and span > 0.05 and lead < 0.9 * (a_end - a_begin):
+        # Packet-accurate AUDIO-only trim (audio frames are independent, video
+        # is not) — this, not -itsoffset, is what fixes the sync: the muxer
+        # rebases each input's start to 0, so shifting timestamps with
+        # -itsoffset is a NO-OP once the streams are muxed (measured: 0.85 s
+        # desync survived -itsoffset, trimmed = 0.03 s).
+        trim = ["ffmpeg", "-y", "-ss", f"{lead:.3f}", "-i", a_fmp4,
+                "-t", f"{span + 0.05:.3f}", "-c:a", "copy", a_trim]
+        tr = subprocess.run(trim, capture_output=True, text=True, timeout=300)
+        if tr.returncode != 0 or not os.path.exists(a_trim) or os.path.getsize(a_trim) == 0:
+            # some codecs/containers refuse a copy trim — re-encode the audio
+            # slice instead (cheap: audio only) so the offset is still gone.
+            tr = subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{lead:.3f}", "-i", a_fmp4,
+                 "-t", f"{span + 0.05:.3f}", "-c:a", "aac", "-b:a", "192k", a_trim],
+                capture_output=True, text=True, timeout=600)
+        if tr.returncode == 0 and os.path.exists(a_trim) and os.path.getsize(a_trim) > 0:
+            a_src = a_trim
+            print(f"[export] miner av-anchor: v@{v_begin:.3f}s a@{a_begin:.3f}s "
+                  f"-> trimmed audio lead {lead:.3f}s, span {span:.3f}s", flush=True)
+
     merged = os.path.join(tmpdir, "merged.mp4")
-    prv, pra = _first_pts(v_fmp4, 0), _first_pts(a_fmp4, 0)
-    cmd = ["ffmpeg", "-y"]
-    if prv is not None and pra is not None and abs(prv - pra) > 0.05:
-        # Align both streams to the LATER content start: delay the earlier
-        # one so every output instant shows the same content time in both.
-        if prv > pra:
-            cmd += ["-itsoffset", f"{prv - pra:.3f}", "-i", a_fmp4, "-i", v_fmp4]
-        else:
-            cmd += ["-itsoffset", f"{pra - prv:.3f}", "-i", v_fmp4, "-i", a_fmp4]
-        print(f"[export] miner av-sync: v@{prv:.3f}s a@{pra:.3f}s "
-              f"-> shift {abs(prv - pra):.3f}s", flush=True)
-    else:
-        cmd += ["-i", v_fmp4, "-i", a_fmp4]
-    cmd += ["-c", "copy", "-movflags", "+faststart", merged]
+    cmd = ["ffmpeg", "-y", "-i", v_fmp4, "-i", a_src, "-c", "copy",
+           "-movflags", "+faststart", merged]
     m = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if m.returncode != 0 or not os.path.exists(merged) or os.path.getsize(merged) == 0:
         raise ValueError(f"fragment merge failed: {(m.stderr or '')[-200:]}")
+
+    # Post-merge sanity: both streams must start together and cover the same
+    # span. A mismatch here means an A/V offset shipped, so warn loudly (the
+    # caller's duration check would not catch it).
+    pv, pa = _first_pts(merged, 0), _first_pts(merged, 1)
+    if pv is not None and pa is not None and abs(pv - pa) > 0.25:
+        print(f"[export] WARNING: merged A/V head mismatch v@{pv:.3f}s a@{pa:.3f}s", flush=True)
     return merged  # fragment-aligned superset of [cut_start, cut_end]
 
 
