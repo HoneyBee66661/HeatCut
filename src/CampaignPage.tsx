@@ -1,9 +1,14 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLanguage } from './locales';
 import { fetchRawClip, requestRawClip, safeFilename, saveBlob, youtubeLink } from './lib/rawExport';
 import { ExportFallbackPanel } from './components/ExportFallbackPanel';
 import type { ExportFallbackTarget } from './components/ExportFallbackPanel';
 import { buildZip, zipEntry, type ZipEntry } from './lib/zipBundle';
+import { fetchWindowTranscript, srtFilename, type WindowTranscript } from './lib/transcript';
+import {
+  clearSessions, deleteSession, readIndex, readLastUrl, readSession, writeLastUrl, writeSession,
+  type PrepSession, type SessionSummary,
+} from './lib/campaignStore';
 
 // ---------------------------------------------------------------- types
 
@@ -98,18 +103,15 @@ interface CampaignPageProps {
   onToast: (message: string | null) => void;
 }
 
-interface HistoryEntry {
-  campaign_id: string;
-  label: string;
-  url: string;
-  at: number;
-}
-
-const HISTORY_KEY = 'heatcut_campaign_history';
-const URL_KEY = 'heatcut_campaign_url';
-
 /** One archive is one download — cap it so the tab never has to hold a huge pack. */
 const ZIP_MAX_BYTES = 1.5 * 1024 * 1024 * 1024;
+
+/**
+ * Clock read behind a module-scope helper: the React Compiler's purity rule
+ * flags a bare `Date.now()` anywhere reachable from render, and this component
+ * legitimately stamps sessions and cache ages on user actions.
+ */
+const nowMs = (): number => Date.now();
 
 const fmt = (sec: number): string => {
   const s = Math.max(0, Math.floor(sec || 0));
@@ -117,27 +119,31 @@ const fmt = (sec: number): string => {
   return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 };
 
-const readHistory = (): HistoryEntry[] => {
-  try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed.slice(0, 6) : [];
-  } catch {
-    return [];
-  }
-};
-
 export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast }: CampaignPageProps) {
   const { t } = useLanguage();
   const c = t.campaign;
 
-  const [url, setUrl] = useState(() => localStorage.getItem(URL_KEY) || '');
+  const [url, setUrl] = useState(readLastUrl);
   const [spec, setSpec] = useState<CampaignSpec | null>(null);
   const [plan, setPlan] = useState<PrepPlan | null>(null);
   const [parsing, setParsing] = useState(false);
   const [prepping, setPrepping] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [history, setHistory] = useState<HistoryEntry[]>(readHistory);
+  // Saved prep sessions (the studio's history feature, campaign-shaped).
+  const [sessions, setSessions] = useState<SessionSummary[]>(readIndex);
+  const [showHistory, setShowHistory] = useState(true);
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [savedAt, setSavedAt] = useState(0);
+  // Caption text + SRT per window, plus what is being transcribed right now.
+  const [transcripts, setTranscripts] = useState<Record<string, WindowTranscript>>({});
+  const [captionsBusy, setCaptionsBusy] = useState<string | null>(null);
+  const [bulkCaptions, setBulkCaptions] = useState<{ done: number; total: number } | null>(null);
+  /** item id → epoch ms of the last successful export (session bookkeeping). */
+  const [exported, setExported] = useState<Record<string, number>>({});
+  /** item id → caption body expanded (long transcripts start collapsed). */
+  const [openCaptions, setOpenCaptions] = useState<Record<string, boolean>>({});
+  const sessionAt = useRef<number>(0);
 
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [targetDuration, setTargetDuration] = useState<15 | 30 | 60>(30);
@@ -202,16 +208,14 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       setMaxTotal(parsed.max_posts_per_user || 15);
       const minDur = parsed.requirements?.min_duration_sec || 15;
       setTargetDuration(minDur > 30 ? 60 : minDur > 15 ? 30 : 15);
-      localStorage.setItem(URL_KEY, url.trim());
-      const entry: HistoryEntry = {
-        campaign_id: parsed.campaign_id,
-        label: parsed.public_name || parsed.name || parsed.campaign_id,
-        url: url.trim(),
-        at: Date.now(),
-      };
-      const next = [entry, ...readHistory().filter(h => h.campaign_id !== entry.campaign_id)].slice(0, 6);
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
-      setHistory(next);
+      writeLastUrl(url.trim());
+      // A fresh parse of this campaign starts a FRESH session timestamp; the
+      // stored session itself is written by the auto-save effect below.
+      sessionAt.current = nowMs();
+      setExported({});
+      setTranscripts({});
+      setManual({});
+      setPlan(null);
       if (!(parsed.sources || []).length) {
         toast(parsed.warnings?.[0] || c.noClips, 6000);
       } else {
@@ -274,6 +278,100 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       return next;
     });
 
+  // ------------------------------------------------------------- sessions
+  // The studio rebuilds its history by scanning `cheat_clip_cache_*`; the
+  // campaign page stores one session per campaign (see lib/campaignStore) and
+  // reloads the WHOLE session — windows, downloads, captions and all.
+
+  const refreshSessions = useCallback(() => setSessions(readIndex()), []);
+
+  const currentSession = useCallback((): PrepSession | null => {
+    if (!spec) return null;
+    return {
+      key: spec.campaign_id,
+      label: spec.public_name || spec.name || spec.campaign_id,
+      url: url.trim(),
+      at: sessionAt.current || nowMs(),
+      updated_at: nowMs(),
+      spec, plan, selected,
+      target_duration: targetDuration,
+      per_source: perSource,
+      max_clips: maxTotal,
+      ai_copy: aiCopy,
+      manual, exported, transcripts,
+    };
+  }, [spec, plan, selected, url, targetDuration, perSource, maxTotal, aiCopy, manual, exported, transcripts]);
+
+  // Debounced auto-save: a new plan, a finished download or a fresh caption
+  // lands in localStorage within a second of the UI going idle.
+  useEffect(() => {
+    const session = currentSession();
+    if (!session) return;
+    const id = setTimeout(() => {
+      const ok = writeSession(session);
+      setSavedAt(ok ? session.updated_at : 0);
+      if (ok) refreshSessions();
+    }, 700);
+    return () => clearTimeout(id);
+  }, [currentSession, refreshSessions]);
+
+  const loadSessionEntry = (key: string) => {
+    const session = readSession(key);
+    if (!session) {
+      refreshSessions();
+      toast(c.sessionMissing, 6000);
+      return;
+    }
+    sessionAt.current = session.at || nowMs();
+    setUrl(session.url || '');
+    setSpec(session.spec || null);
+    setPlan(session.plan || null);
+    setSelected(session.selected || {});
+    setTargetDuration((session.target_duration || 30) as 15 | 30 | 60);
+    setPerSource(session.per_source || 4);
+    setMaxTotal(session.max_clips || 15);
+    setAiCopy(!!session.ai_copy);
+    setManual(session.manual || {});
+    setExported(session.exported || {});
+    setTranscripts(session.transcripts || {});
+    setFallback(null);
+    setError(null);
+    toast(c.sessionLoaded(session.label), 6000);
+  };
+
+  const removeSessionEntry = (key: string, label: string) => {
+    deleteSession(key);
+    refreshSessions();
+    toast(c.sessionRemoved(label), 4000);
+  };
+
+  const clearAllSessions = () => {
+    if (!confirmClear) {
+      setConfirmClear(true);
+      setTimeout(() => setConfirmClear(false), 4000);
+      return;
+    }
+    clearSessions();
+    refreshSessions();
+    setConfirmClear(false);
+    toast(c.sessionCleared, 4000);
+  };
+
+  const filteredSessions = useMemo(() => {
+    const q = historyQuery.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter(s => `${s.label} ${s.key}`.toLowerCase().includes(q));
+  }, [sessions, historyQuery]);
+
+  const relativeTime = useCallback((ts: number): string => {
+    const mins = Math.floor((nowMs() - (ts || 0)) / 60000);
+    if (mins < 1) return t.relativeTime.justNow;
+    if (mins < 60) return t.relativeTime.minsAgo(mins);
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return t.relativeTime.hrsAgo(hrs);
+    return t.relativeTime.daysAgo(Math.floor(hrs / 24));
+  }, [t]);
+
   const downloadItem = async (item: PlanItem) => {
     const key = item.id;
     if (exportingKey) return;
@@ -296,6 +394,7 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       }
       saveBlob(result.blob, `heatcut_${safeFilename(item.source_label)}_${Math.floor(item.start)}-${Math.floor(item.end)}s.mp4`);
       clearManual(key);
+      setExported(prev => ({ ...prev, [key]: nowMs() }));
       toast(null);
     } catch (err) {
       // Not a dead end: the window stays in the pack as a MANUAL cut with a
@@ -320,6 +419,7 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
         const blob = await fetchRawClip(items[i].video_id, items[i].start, items[i].end, items[i].source_label);
         saveBlob(blob, `heatcut_${safeFilename(items[i].source_label)}_${Math.floor(items[i].start)}-${Math.floor(items[i].end)}s.mp4`);
         clearManual(items[i].id);
+        setExported(prev => ({ ...prev, [items[i].id]: nowMs() }));
         ok += 1;
       } catch (err) {
         // Keep going: one blocked source must not cancel the rest of the pack.
@@ -396,12 +496,14 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     let bytes = 0;
     setBulk({ done: 0, total: items.length });
     setBulkZip(true);
-    for (let i = 0; i < items.length; i += 1) {
+    // `for … of entries()` instead of an index loop: the React Compiler flags a
+    // mutated `let i` inside this async body (react-hooks/immutability).
+    for (const [i, item] of items.entries()) {
       setBulk({ done: i, total: items.length });
       try {
-        const blob = await fetchRawClip(items[i].video_id, items[i].start, items[i].end, items[i].source_label);
+        const blob = await fetchRawClip(item.video_id, item.start, item.end, item.source_label);
         const entry = await zipEntry(
-          `heatcut_${safeFilename(items[i].source_label)}_${Math.floor(items[i].start)}-${Math.floor(items[i].end)}s.mp4`,
+          `heatcut_${safeFilename(item.source_label)}_${Math.floor(item.start)}-${Math.floor(item.end)}s.mp4`,
           blob,
         );
         bytes += entry.size;
@@ -412,10 +514,11 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
           return;
         }
         entries.push(entry);
-        clearManual(items[i].id);
+        clearManual(item.id);
+        setExported(prev => ({ ...prev, [item.id]: nowMs() }));
       } catch (err) {
-        markManual(items[i].id, err instanceof Error ? err.message : c.exportFailed);
-        blocked.push(items[i]);
+        markManual(item.id, err instanceof Error ? err.message : c.exportFailed);
+        blocked.push(item);
       }
       await new Promise(r => setTimeout(r, 120));
     }
@@ -429,10 +532,109 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     if (blocked.length) {
       entries.push(await zipEntry('MANUAL_CUTS.md', new Blob([manualListMd(blocked)], { type: 'text/markdown' })));
     }
+    // Captions ride along: one .srt per clip that has one, plus CAPTIONS.md.
+    let srtCount = 0;
+    for (const item of items) {
+      const srt = transcripts[item.id]?.srt;
+      if (!srt) continue;
+      entries.push(await zipEntry(`heatcut_${srtFilename(item.source_label, item.start, item.end)}`,
+                                  new Blob([srt], { type: 'application/x-subrip' })));
+      srtCount += 1;
+    }
+    const captions = captionsMd(items);
+    if (captions) {
+      entries.push(await zipEntry('CAPTIONS.md', new Blob([captions], { type: 'text/markdown' })));
+    }
     saveBlob(buildZip(entries), `heatcut_campaign_${plan.campaign_id || 'pack'}_raw.zip`);
     setBulk(null);
     setBulkZip(false);
-    toast(c.zipDone(entries.filter(e => e.name.endsWith('.mp4')).length, blocked.length), 8000);
+    toast(c.zipDone(entries.filter(e => e.name.endsWith('.mp4')).length, blocked.length, srtCount), 9000);
+  };
+
+  // ------------------------------------------------- captions (text + SRT)
+  // One window at a time: the caption ladder is cheap (server-side scraped
+  // captions) but the Whisper fallback is 10-60 s of CPU on one core, so a bulk
+  // run is sequential and reports progress instead of firing N requests.
+
+  const captionOne = async (item: PlanItem): Promise<WindowTranscript | null> => {
+    if (captionsBusy) return null;
+    setCaptionsBusy(item.id);
+    try {
+      const result = await fetchWindowTranscript(item.video_id, item.start, item.end);
+      setTranscripts(prev => ({ ...prev, [item.id]: result }));
+      if (result.source === 'none') {
+        toast(c.captionNoneNote(result.note || ''), 7000);
+      } else {
+        toast(c.captionReady(result.source === 'whisper' ? c.captionSourceWhisper : c.captionSourceYt,
+                            (result.lines || []).length), 5000);
+      }
+      return result;
+    } catch (err) {
+      toast(c.captionNoneNote(err instanceof Error ? err.message : String(err)), 7000);
+      return null;
+    } finally {
+      setCaptionsBusy(null);
+    }
+  };
+
+  const captionAll = async () => {
+    if (!plan || bulkCaptions || captionsBusy) return;
+    const items = plan.items;
+    setBulkCaptions({ done: 0, total: items.length });
+    let ok = 0;
+    let none = 0;
+    for (let i = 0; i < items.length; i += 1) {
+      setBulkCaptions({ done: i, total: items.length });
+      const result = await captionOne(items[i]);
+      if (result && result.source !== 'none' && (result.lines || []).length) ok += 1;
+      else none += 1;
+    }
+    setBulkCaptions({ done: items.length, total: items.length });
+    toast(c.captionAllDone(ok, none), 9000);
+    setTimeout(() => setBulkCaptions(null), 1500);
+  };
+
+  const downloadSrt = (item: PlanItem) => {
+    const srt = transcripts[item.id]?.srt;
+    if (!srt) return;
+    saveBlob(new Blob([srt], { type: 'application/x-subrip' }),
+             `heatcut_${srtFilename(item.source_label, item.start, item.end)}`);
+  };
+
+  const captionsCount = useMemo(
+    () => (plan?.items || []).filter(i => (transcripts[i.id]?.lines || []).length).length,
+    [plan, transcripts],
+  );
+
+  /** CAPTIONS.md — every window's words with its jump link, for the pack. */
+  const captionsMd = (items: PlanItem[]): string => {
+    const rows = items.filter(i => (transcripts[i.id]?.text || '').trim());
+    if (!rows.length) return '';
+    const lines = [`## ${c.captionMdTitle}`, '', c.captionMdHint, ''];
+    rows.forEach(item => {
+      const tr = transcripts[item.id];
+      const engine = tr.source === 'whisper' ? c.captionSourceWhisper : c.captionSourceYt;
+      lines.push(`### ${item.timestamp} · ${item.source_label}${item.section_label ? ` · ${item.section_label}` : ''}`);
+      lines.push(`- ${item.title}`);
+      lines.push(`- Engine: ${engine}${tr.model ? ` (${tr.model})` : ''}${tr.language ? ` · ${tr.language}` : ''}`);
+      lines.push(`- Jump: ${itemLink(item)}`);
+      lines.push('');
+      lines.push(tr.text);
+      lines.push('');
+    });
+    return lines.join('\n');
+  };
+
+  const copyCaptions = () => {
+    const md = captionsMd(plan?.items || []);
+    if (md) copyText(md, c.captionMdTitle);
+    else toast(c.captionNoneYet, 4000);
+  };
+
+  const downloadCaptionsMd = () => {
+    const md = captionsMd(plan?.items || []);
+    if (md) saveBlob(new Blob([md], { type: 'text/markdown' }),
+                     `heatcut_campaign_${plan?.campaign_id || 'captions'}_captions.md`);
   };
 
   // ---------------------------------------------------------------- render help
@@ -479,31 +681,89 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
         </form>
         <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--text-muted)' }}>{c.parseHint}</p>
 
-        {history.length > 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <span style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>{c.sessionTitle}</span>
+        {sessions.length > 0 && (
+          <div
+            style={{
+              display: 'flex', flexDirection: 'column', gap: '0.55rem', padding: '0.7rem 0.85rem',
+              borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>
+                🗂️ {c.sessionTitle}
+              </span>
+              <span className="score-badge score-meta" style={{ fontSize: '0.66rem' }}>{sessions.length}</span>
+              <input
+                className="form-input"
+                style={{ width: 190, padding: '0.3rem 0.6rem', fontSize: '0.75rem' }}
+                placeholder={c.historySearch}
+                value={historyQuery}
+                onChange={(e) => setHistoryQuery(e.target.value)}
+              />
               <button
                 type="button"
-                onClick={() => { localStorage.removeItem(HISTORY_KEY); setHistory([]); }}
-                style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontSize: '0.72rem', cursor: 'pointer', textDecoration: 'underline' }}
+                onClick={() => setShowHistory(v => !v)}
+                style={{ background: 'none', border: 'none', color: 'var(--accent)', fontSize: '0.72rem', cursor: 'pointer', fontWeight: 600 }}
               >
-                {c.clearSession}
+                {showHistory ? c.historyHide : c.historyShow}
+              </button>
+              <button
+                type="button"
+                onClick={clearAllSessions}
+                style={{ background: 'none', border: 'none', color: confirmClear ? '#fca5a5' : 'var(--text-muted)', fontSize: '0.72rem', cursor: 'pointer', textDecoration: 'underline' }}
+              >
+                {confirmClear ? c.historyConfirmClear : c.historyClearAll}
               </button>
             </div>
-            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-              {history.map(h => (
-                <button
-                  key={h.campaign_id}
-                  type="button"
-                  className="duration-btn"
-                  onClick={() => { setUrl(h.url); }}
-                  title={c.sessionHint}
-                >
-                  {h.label.slice(0, 42)}
-                </button>
-              ))}
-            </div>
+            <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)' }}>{c.historyHint}</p>
+
+            {showHistory && (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: '0.5rem' }}>
+                {filteredSessions.map(s => (
+                  <div
+                    key={s.key}
+                    style={{
+                      display: 'flex', gap: '0.6rem', padding: '0.6rem 0.7rem', borderRadius: 10,
+                      background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+                    }}
+                  >
+                    {s.thumbnail
+                      ? <img src={s.thumbnail} alt="" style={{ width: 62, height: 40, borderRadius: 8, objectFit: 'cover' }} />
+                      : <div style={{ width: 62, height: 40, borderRadius: 8, background: 'rgba(255,255,255,0.05)' }} />}
+                    <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                      <span style={{ fontSize: '0.82rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={s.label}>
+                        {s.label}
+                      </span>
+                      <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                        {relativeTime(s.updated_at)} · {c.historyItems(s.items)} · {c.historyExported(s.exported)}
+                        {s.captions > 0 ? ` · ${c.historyCaptions(s.captions)}` : ''}
+                      </span>
+                      <div style={{ display: 'flex', gap: '0.4rem', marginTop: 3 }}>
+                        <button
+                          type="button"
+                          className="form-input"
+                          style={{ width: 'auto', padding: '0.25rem 0.6rem', fontSize: '0.72rem', cursor: 'pointer', background: 'transparent' }}
+                          onClick={() => loadSessionEntry(s.key)}
+                          title={c.sessionHint}
+                        >
+                          ↺ {c.historyLoad}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeSessionEntry(s.key, s.label)}
+                          style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontSize: '0.72rem', cursor: 'pointer', textDecoration: 'underline' }}
+                        >
+                          {c.historyDelete}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {!filteredSessions.length && (
+                  <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{c.historyNoMatch}</span>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -718,6 +978,11 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
             {plan.copy_note && (
               <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>{c.copyNoteLabel}: {plan.copy_note}</span>
             )}
+            {!!savedAt && (
+              <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }} title={c.historyHint}>
+                💾 {c.sessionSaved(relativeTime(savedAt))}
+              </span>
+            )}
             <div style={{ display: 'flex', gap: '0.4rem', marginLeft: 'auto', flexWrap: 'wrap' }}>
               <button type="button" className="form-input" style={{ width: 'auto', padding: '0.45rem 0.85rem', fontSize: '0.78rem', cursor: 'pointer', background: 'transparent' }} onClick={copyTimestamps}>
                 ⏱️ {c.copyTimestamps}
@@ -732,6 +997,36 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                 onClick={() => saveBlob(new Blob([plan.brief_md], { type: 'text/markdown' }), `heatcut_campaign_${plan.campaign_id || 'brief'}.md`)}
               >
                 📥 {c.downloadBrief}
+              </button>
+              <button
+                type="button"
+                className="form-input"
+                style={{ width: 'auto', padding: '0.45rem 0.85rem', fontSize: '0.78rem', cursor: 'pointer', background: 'transparent', opacity: captionsCount ? 1 : 0.5 }}
+                onClick={copyCaptions}
+                title={c.captionHint}
+                disabled={!captionsCount}
+              >
+                💬 {c.captionCopyAll(captionsCount)}
+              </button>
+              <button
+                type="button"
+                className="form-input"
+                style={{ width: 'auto', padding: '0.45rem 0.85rem', fontSize: '0.78rem', cursor: 'pointer', background: 'transparent', opacity: captionsCount ? 1 : 0.5 }}
+                onClick={downloadCaptionsMd}
+                title={c.captionHint}
+                disabled={!captionsCount}
+              >
+                📄 {c.captionDownloadMd}
+              </button>
+              <button
+                type="button"
+                className="glowing-btn"
+                style={{ padding: '0.45rem 1rem', fontSize: '0.78rem' }}
+                disabled={!plan.items.length || !!bulk || !!bulkCaptions || !!captionsBusy}
+                onClick={captionAll}
+                title={c.captionHint}
+              >
+                {bulkCaptions ? c.captionAllProgress(bulkCaptions.done, bulkCaptions.total) : `🎙️ ${c.captionForAll}`}
               </button>
               <button
                 type="button"
@@ -775,6 +1070,7 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
           </div>
 
           <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)' }}>{c.bulkHint}</p>
+          <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)' }}>{c.captionHint}</p>
 
           {!!plan.warnings?.length && (
             <div style={{ padding: '0.65rem 0.85rem', borderRadius: 10, background: 'rgba(251, 191, 36, 0.07)', border: '1px solid rgba(251, 191, 36, 0.28)', fontSize: '0.8rem', color: '#fcd34d' }}>
@@ -906,6 +1202,103 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                         </div>
                       )}
                     </div>
+
+                    {/* Caption text + SRT for this window */}
+                    {(() => {
+                      const tr = transcripts[item.id];
+                      const busy = captionsBusy === item.id;
+                      const hasWords = !!tr && tr.source !== 'none' && (tr.lines || []).length > 0;
+                      const open = !!openCaptions[item.id];
+                      const body = tr?.text || '';
+                      const short = body.length > 260 && !open ? `${body.slice(0, 260)}…` : body;
+                      return (
+                        <div style={{ marginTop: '0.6rem', paddingTop: '0.55rem', borderTop: '1px dashed rgba(255,255,255,0.09)' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-muted)' }}>
+                              💬 {c.captionSection}
+                            </span>
+                            {hasWords && (
+                              <span
+                                className={`score-badge ${tr.source === 'whisper' ? 'score-meta' : 'score-high'}`}
+                                style={{ fontSize: '0.65rem', whiteSpace: 'nowrap' }}
+                                title={tr.note || undefined}
+                              >
+                                {tr.source === 'whisper' ? `🎙️ ${c.captionSourceWhisper}` : `📺 ${c.captionSourceYt}`}
+                                {tr.model ? ` · ${tr.model}` : ''}{tr.language ? ` · ${tr.language}` : ''}
+                                {tr.cached ? ` · ${c.captionCached}` : ''}
+                                {` · ${tr.lines.length} ${c.captionLines}`}
+                              </span>
+                            )}
+                            <div style={{ display: 'flex', gap: '0.4rem', marginLeft: 'auto', flexWrap: 'wrap' }}>
+                              {hasWords && (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="form-input"
+                                    style={{ width: 'auto', padding: '0.35rem 0.7rem', fontSize: '0.74rem', cursor: 'pointer', background: 'transparent' }}
+                                    onClick={() => copyText(tr.text, c.captionCopyLabel)}
+                                  >
+                                    📋 {c.captionCopy}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="form-input"
+                                    style={{ width: 'auto', padding: '0.35rem 0.7rem', fontSize: '0.74rem', cursor: 'pointer', background: 'transparent' }}
+                                    onClick={() => downloadSrt(item)}
+                                    title={c.captionSrtNote}
+                                  >
+                                    📥 {c.captionDownloadSrt}
+                                  </button>
+                                </>
+                              )}
+                              <button
+                                type="button"
+                                className="form-input"
+                                style={{ width: 'auto', padding: '0.35rem 0.7rem', fontSize: '0.74rem', cursor: 'pointer', background: 'transparent' }}
+                                disabled={busy || !!bulkCaptions}
+                                onClick={() => captionOne(item)}
+                                title={c.captionHint}
+                              >
+                                {busy
+                                  ? `⏳ ${c.captionWorking}`
+                                  : tr ? `🔁 ${c.captionRetry}` : `🎙️ ${c.captionGet}`}
+                              </button>
+                            </div>
+                          </div>
+
+                          {busy && (
+                            <div style={{ marginTop: 5, fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                              ⏳ {c.captionWorkingHint}
+                            </div>
+                          )}
+
+                          {!busy && hasWords && (
+                            <div style={{ marginTop: 6 }}>
+                              <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', fontStyle: 'italic', lineHeight: 1.5 }}>
+                                “{short}”
+                              </div>
+                              {body.length > 260 && (
+                                <button
+                                  type="button"
+                                  onClick={() => setOpenCaptions(prev => ({ ...prev, [item.id]: !open }))}
+                                  style={{ background: 'none', border: 'none', color: 'var(--accent)', fontSize: '0.72rem', cursor: 'pointer', padding: 0, marginTop: 3 }}
+                                >
+                                  {open ? c.captionShowLess : c.captionShowMore}
+                                </button>
+                              )}
+                            </div>
+                          )}
+
+                          {!busy && tr && !hasWords && (
+                            <div style={{ marginTop: 5, fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                              {tr.source === 'none'
+                                ? `⚠️ ${c.captionNone}${tr.note ? ` — ${tr.note}` : ''}`
+                                : `⚠️ ${c.captionNoWords}`}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 ))}
               </div>

@@ -12,7 +12,7 @@
 //          choose "whole video (with an ETA)" or "download the source".
 //   full — the whole-video route, only on the user's explicit request.
 
-const HEATMAP_WORKER_URL: string =
+export const HEATMAP_WORKER_URL: string =
   (import.meta.env.VITE_HEATMAP_WORKER_URL as string | undefined) || 'http://127.0.0.1:8765';
 
 const HEATMAP_WORKER_TOKEN: string =
@@ -21,7 +21,7 @@ const HEATMAP_WORKER_TOKEN: string =
 const IS_LOOPBACK_WORKER = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|$)/i.test(HEATMAP_WORKER_URL);
 const WORKER_PROBE_TIMEOUT_MS = IS_LOOPBACK_WORKER ? 400 : 2500;
 
-const workerHeaders = (): Record<string, string> =>
+export const workerHeaders = (): Record<string, string> =>
   HEATMAP_WORKER_TOKEN ? { 'X-Heatcut-Token': HEATMAP_WORKER_TOKEN } : {};
 
 export const safeFilename = (raw: string): string =>
@@ -42,7 +42,7 @@ export const youtubeLink = (videoId: string, startTime: number): string =>
   videoId ? `https://www.youtube.com/watch?v=${videoId}&t=${Math.max(0, Math.floor(startTime || 0))}s` : '';
 
 /** True when a device/tunneled worker answers the loopback-style health probe. */
-async function workerIsOnline(): Promise<boolean> {
+export async function workerIsOnline(): Promise<boolean> {
   try {
     const probe = await fetch(`${HEATMAP_WORKER_URL}/health`, {
       signal: AbortSignal.timeout(WORKER_PROBE_TIMEOUT_MS),

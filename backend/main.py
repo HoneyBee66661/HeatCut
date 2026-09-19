@@ -1846,6 +1846,211 @@ def _auto_partial_export(url: str, tmpdir: str, cut_start: float, cut_end: float
     raise PartialBlocked("yt_bot_check" if _looks_like_botcheck(joined) else "yt_partial_blocked", joined)
 
 
+def _asr_module():
+    """Import the local-ASR module lazily (both `backend.main` and package runs)."""
+    try:
+        from backend import asr as asr_mod  # type: ignore
+    except ImportError:  # noqa: BLE001 — `uvicorn main:app` style import
+        import asr as asr_mod  # type: ignore
+    return asr_mod
+
+
+def _asr_enabled() -> bool:
+    """Master switch (HEATCUT_ASR=0 disables) + engine presence."""
+    if (os.environ.get("HEATCUT_ASR") or "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    try:
+        ok, _reason = _asr_module().whisper_available()
+        return bool(ok)
+    except Exception:  # noqa: BLE001 — module missing on a slim deploy
+        return False
+
+
+def _asr_pick_audio_format(info: Any) -> Optional[dict]:
+    """Best audio-ONLY https stream (typically m4a/128k) for transcription.
+
+    Audio-only matters: it is ~1/20 of the bytes of a muxed HLS rendition, and
+    the fragment miner can range it exactly like the video streams.
+    """
+    best = None
+    best_score = (-1, -1)
+    for fmt in (info or {}).get("formats") or []:
+        if fmt.get("vcodec") not in (None, "none") or fmt.get("acodec") in (None, "none"):
+            continue
+        protocol = str(fmt.get("protocol") or "")
+        if "http" not in protocol or "m3u8" in protocol or not fmt.get("url"):
+            continue
+        score = (1 if str(fmt.get("ext")) in ("m4a", "mp4", "aac") else 0, int(fmt.get("abr") or 0))
+        if score > best_score:
+            best, best_score = fmt, score
+    return best
+
+
+def _ffmpeg_run(cmd: List[str], timeout: int = 300) -> bool:
+    try:
+        proc = subprocess.run(["ffmpeg", "-y", "-v", "error", *cmd],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _stream_pts_span(path: str, stream: int = 1) -> tuple:
+    """(first, last) packet PTS of a stream — the honest content span of a slice.
+
+    `ffprobe -show_entries format=duration` lies on assembled fMP4 parts (it
+    reports the moov-nominal duration), so the span is read from packet times.
+    """
+    spec = "v:0" if stream == 0 else "a:0"
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", spec,
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return (None, None)
+    values: List[float] = []
+    for line in out.stdout.splitlines():
+        field = line.split(",")[0].strip()
+        if field and field.lower() != "n/a":
+            try:
+                values.append(float(field))
+            except ValueError:
+                continue
+    if not values:
+        return (None, None)
+    return (min(values), max(values))
+
+
+def _ffmpeg_extract_wav(src: str, dst: str, ss: float = 0.0, duration: float = 0.0) -> bool:
+    """16 kHz mono PCM wav out of an audio/video file — the ASR input format.
+
+    A trim (`ss > 0`) decodes the WHOLE source first and then seeks with an
+    OUTPUT-side `-ss`. Measured trap: an input-side `-ss` on a fragment-range
+    m4a slice (fragments carry absolute PTS) decodes to loud but garbled audio —
+    whisper answered one hallucinated word for 34 s of real lyrics. The wav is
+    cheap to make, so decode in full and cut from the wav.
+    """
+    tail = ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"]
+    if ss > 0.05:
+        full = f"{dst}.full.wav"
+        try:
+            if not _ffmpeg_run(["-i", src, *tail, full]):
+                return False
+            cmd = ["-i", full, "-ss", f"{ss:.3f}"]
+            if duration > 0:
+                cmd += ["-t", f"{duration:.3f}"]
+            ok = _ffmpeg_run([*cmd, "-c:a", "pcm_s16le", dst])
+        finally:
+            if os.path.exists(full):
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+        if not ok:
+            return False
+    else:
+        cmd = ["-i", src]
+        if duration > 0:
+            cmd += ["-t", f"{duration:.3f}"]
+        if not _ffmpeg_run([*cmd, *tail, dst]):
+            return False
+    return os.path.exists(dst) and os.path.getsize(dst) > 1000
+
+
+def _asr_audio_clients() -> List[Optional[str]]:
+    """Player clients to try for an audio-ONLY stream (None = yt-dlp default).
+
+    Measured: the DEFAULT client exposes the audio-only DASH streams
+    (`140` m4a 129k) whose fragment ranges serve fine, while `web_safari` (the
+    best client for VIDEO on this host) offers muxed HLS only — no audio-only
+    format at all. Trying `default` first turns a ~12 MB HLS window into
+    ~0.8 MB of ranged audio.
+    """
+    raw = (os.environ.get("HEATCUT_ASR_AUDIO_CLIENTS") or "default,web_safari").strip()
+    clients: List[Optional[str]] = []
+    for name in (c.strip() for c in raw.split(",")):
+        if not name:
+            continue
+        clients.append(None if name == "default" else name)
+    return clients or [None]
+
+
+def _asr_audio_format(video_id: str, client: Optional[str]) -> Optional[dict]:
+    """Extract with one player client and pick its best audio-only stream."""
+    import yt_dlp
+    opts: Any = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "socket_timeout": 15, "retries": 2, "skip_download": True,
+        **( {"cookiefile": _cf} if (_cf := get_yt_cookiefile()) else {} ),
+        **_yt_env_opts(),
+    }
+    if client:
+        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    return _asr_pick_audio_format(info)
+
+
+def _asr_audio_wav(video_id: str, cut_start: float, cut_end: float, tmpdir: str) -> str:
+    """Wav of the PADDED window, starting exactly at `cut_start`.
+
+    Ladder (cheapest first):
+      1. audio-only DASH fragment range — ~0.8 MB for a 30 s window, tried
+         across `HEATCUT_ASR_AUDIO_CLIENTS` (default: default,web_safari);
+      2. the export ladder's own clip (HLS segments / full fallback) with its
+         video track stripped — ~12 MB, but already proven to serve bytes.
+    Both paths start at `cut_start`, so whisper's t=0 is the exported clip's
+    t=0 and the SRT built from it lines up with the downloaded mp4.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    span = max(0.5, float(cut_end) - float(cut_start))
+    wav = os.path.join(tmpdir, "asr.wav")
+    problems: List[str] = []
+
+    for client in _asr_audio_clients():
+        label = client or "default"
+        try:
+            fmt = _asr_audio_format(video_id, client)
+            if fmt is None:
+                problems.append(f"{label}: no audio-only stream")
+                continue
+            data, _content_begin, _content_end = _download_fmp4_window(fmt, cut_start, cut_end)
+            src = os.path.join(tmpdir, "asr_audio.m4a")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            # The slices are fragment-aligned and carry ABSOLUTE PTS, and the
+            # sidx time base does not always agree with them — so trust the
+            # packets, not the sidx: the slice must COVER the window, and the
+            # offset is computed from the real first PTS.
+            first, last = _stream_pts_span(src, 1)
+            if first is None or last is None:
+                problems.append(f"{label}: audio slice has no packet times")
+                continue
+            if first > cut_start + 1.0 or last < cut_end - 1.0:
+                problems.append(f"{label}: slice covers {first:.1f}-{last:.1f}s, window is {cut_start:.1f}-{cut_end:.1f}s")
+                continue
+            if _ffmpeg_extract_wav(src, wav, ss=max(0.0, cut_start - first), duration=span):
+                logger.info("[asr] %s %.1f-%.1fs audio via DASH range (client=%s, %d KB, slice %.1f-%.1fs)",
+                            video_id, cut_start, cut_end, label, len(data) // 1024, first, last)
+                return wav
+            problems.append(f"{label}: audio range could not be decoded")
+        except Exception as e:  # noqa: BLE001 — refused range / bot check / no sidx / extraction
+            problems.append(f"{label}: {str(e)[:100]}")
+            logger.info("[asr] %s audio-only client=%s failed (%s)", video_id, label, str(e)[:110])
+
+    try:
+        clip = _auto_partial_export(url, tmpdir, cut_start, cut_end)
+        if _ffmpeg_extract_wav(clip, wav, ss=0.0, duration=span):
+            logger.info("[asr] %s %.1f-%.1fs audio from the export ladder", video_id, cut_start, cut_end)
+            return wav
+        problems.append("clip carried no decodable audio")
+    except Exception as e:  # noqa: BLE001 — PartialBlocked, ffmpeg failure, ...
+        problems.append(f"clip ladder refused ({str(e)[:110]})")
+
+    raise ValueError("; ".join(problems) or "no audio could be fetched")
+
+
 def _estimate_full_seconds(info: Any) -> int:
     """Rough ETA for the whole-video route — the UI counts this down."""
     try:
@@ -2225,6 +2430,10 @@ def health_check():
         # (serverless), in which case exports use EXPORT_TMP_ROOT's fallback.
         "export_tmp_root": EXPORT_TMP_ROOT,
         "export_tmp_ok": EXPORT_TMP_OK,
+        # local transcription (captions → Whisper fallback) — what this host can do
+        "asr_enabled": _asr_enabled(),
+        "asr_model": (os.environ.get("HEATCUT_WHISPER_MODEL") or "small"),
+        "asr_engine": "faster-whisper (local, cpu int8)",
     }
 
 
@@ -3943,4 +4152,94 @@ async def campaign_prep(request: CampaignPrepRequest):
         spec.get("campaign_id"), len(plan.get("items") or []), len(urls), copy_note or "no copy pass",
     )
     return plan
+
+
+# --------------------------------------------------------------- transcript/SRT
+
+class TranscriptWindowRequest(BaseModel):
+    """One clip window → caption text + SRT (captions first, Whisper otherwise)."""
+    video_id: str = ""
+    url: str = ""
+    start: float = 0.0
+    end: float = 0.0
+    language: str = ""
+    model: str = ""
+    use_captions: bool = True
+    allow_whisper: bool = True
+
+
+# Only ONE local transcription at a time: `small` peaks around 0.6 GB RSS on
+# this 2 vCPU box, which also runs the API, the worker and vite. Caption
+# requests are cheap and never wait on this lock (see the route).
+ASR_LOCK = threading.Lock()
+ASR_LOCK_WAIT = float(os.environ.get("HEATCUT_ASR_LOCK_WAIT", "600"))
+TRANSCRIPT_RATE_LIMIT = int(os.environ.get("HEATCUT_TRANSCRIPT_RATE_LIMIT", "120"))
+
+
+def _transcript_window_blocking(video_id: str, start: float, end: float,
+                                request: TranscriptWindowRequest) -> dict:
+    """Thread body: captions first, then the Whisper child process."""
+    asr_mod = _asr_module()
+    tmpdir = _new_export_tmp_dir_or_500()
+    try:
+        def captions_fn(vid: str) -> List[dict]:
+            return fetch_transcript(vid) or []
+
+        def audio_fn(vid: str, cut_start: float, cut_end: float) -> str:
+            return _asr_audio_wav(vid, cut_start, cut_end, tmpdir)
+
+        kwargs = {
+            "captions_fn": captions_fn if request.use_captions else None,
+            "audio_fn": audio_fn if request.allow_whisper else None,
+            "model": (request.model or "").strip(),
+            "language": (request.language or "").strip(),
+        }
+        # Pass 1 (no lock): captions are a couple of seconds of network work and
+        # must not queue behind a running transcription.
+        result = asr_mod.window_transcript(video_id, start, end, allow_whisper=False, **kwargs)
+        if result.get("source") != "none" or not request.allow_whisper:
+            return result
+        if not _asr_enabled():
+            return result
+        # Pass 2 (serialized): the CPU-heavy local engine, one window at a time.
+        if not ASR_LOCK.acquire(timeout=ASR_LOCK_WAIT):
+            return result
+        try:
+            return asr_mod.window_transcript(video_id, start, end, use_captions=False, **kwargs)
+        finally:
+            ASR_LOCK.release()
+    finally:
+        _finish_export_job(tmpdir)
+
+
+@app.post("/api/transcript/window")
+async def transcript_window(request: TranscriptWindowRequest, http_request: Request):
+    """Caption text + SRT for ONE clip window.
+
+    Ladder: the video's captions (yt-dlp / direct / Supadata, whatever
+    `fetch_transcript` finds) → local faster-whisper on the audio of the SAME
+    padded window the export route cuts → `source: "none"` with a plain-language
+    note. Keyless and deterministic; the SRT is timed against the exported clip
+    so it drops straight onto the downloaded mp4.
+    """
+    video_id = (request.video_id or extract_video_id(request.url or "") or "").strip()
+    if not video_id:
+        raise HTTPException(status_code=400, detail="A YouTube video_id or url is required.")
+    if request.end <= request.start:
+        raise HTTPException(status_code=400, detail="end must be greater than start.")
+    max_window = float(os.environ.get("HEATCUT_WHISPER_MAX_WINDOW", "600"))
+    if request.end - request.start > max_window:
+        raise HTTPException(status_code=400,
+                            detail=f"Window too long ({request.end - request.start:.0f}s) — max {int(max_window)}s.")
+
+    if _rate_limited(f"transcript:{_client_ip(http_request)}", TRANSCRIPT_RATE_LIMIT, 3600.0):
+        raise HTTPException(status_code=429,
+                            detail=f"Too many transcript requests from this address (max {TRANSCRIPT_RATE_LIMIT}/hour).")
+
+    result = await asyncio.to_thread(_transcript_window_blocking, video_id, request.start, request.end, request)
+    result["video_id"] = video_id
+    logger.info("Transcript window %s %.1f-%.1fs → %s (%d lines, %.1fs)",
+                video_id, request.start, request.end, result.get("source"),
+                len(result.get("lines") or []), float(result.get("elapsed") or 0.0))
+    return result
 
