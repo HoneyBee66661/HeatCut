@@ -23,6 +23,16 @@ export const safeFilename = (raw: string): string =>
     .replace(/^_+|_+$/g, '')
     .slice(0, 80) || 'clip';
 
+/**
+ * Labeled jump link to the exact second of a source video.
+ *
+ * Manual-fallback deliverable: when the automatic export is refused (YouTube
+ * 403 / bot check / worker offline) the editor must still get something
+ * actionable — a link that opens the source AT the window's start second.
+ */
+export const youtubeLink = (videoId: string, startTime: number): string =>
+  videoId ? `https://www.youtube.com/watch?v=${videoId}&t=${Math.max(0, Math.floor(startTime || 0))}s` : '';
+
 /** True when a device/tunneled worker answers the loopback-style health probe. */
 async function workerIsOnline(): Promise<boolean> {
   try {

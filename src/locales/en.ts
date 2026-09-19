@@ -274,6 +274,30 @@ export const en = {
     timestampsCopied: "Timestamps",
     copyCopied: "Clip copy",
     exportFailed: "Export failed",
+    openAtTime: "Open at this time",
+    copyLink: "Copy link",
+    linkCopied: "Jump link",
+    manualBadge: "manual cut",
+    retryDownload: "Retry",
+    manualTitle: (n: number) => `${n} window(s) blocked for auto-download — cut these manually`,
+    manualHint: "YouTube refused the media fetch for these windows (403 / bot check). Each one keeps a labeled jump link to the exact second: open it and trim by hand, or retry.",
+    manualListTitle: "Manual cut list",
+    manualCopyList: "Copy manual list",
+    manualCopyListCount: (n: number) => `Copy manual list (${n})`,
+    manualDownloadList: "Manual list .md",
+    manualListCopied: "Manual cut list",
+    manualFallback: (msg: string) => `${msg} — kept as a manual cut with a jump link.`,
+    downloadAllDone: (ok: number, failed: number) =>
+      failed
+        ? `${ok} clip(s) exported, ${failed} blocked — see the manual cut list.`
+        : `${ok} clip(s) exported.`,
+    zipAll: "Zip all RAW",
+    zippingAll: (done: number, total: number) => `Zipping ${done}/${total}...`,
+    zipDone: (clips: number, blocked: number) =>
+      `Pack downloaded as ONE .zip — ${clips} clip(s) + BRIEF.md${blocked ? ` + MANUAL_CUTS.md (${blocked} blocked)` : ''}.`,
+    zipEmpty: "Nothing to zip — every window was blocked (see the manual cut list).",
+    zipTooBig: "Pack too big for a single archive (>1.5 GB) — download the clips individually.",
+    bulkHint: "“Download all” fires one download per clip: your browser may ask ONCE to allow multiple downloads (allow it, or use “Zip all” for a single file).",
   }
 };
 

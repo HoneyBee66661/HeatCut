@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useLanguage } from './locales';
-import { fetchRawClip, safeFilename, saveBlob } from './lib/rawExport';
+import { fetchRawClip, safeFilename, saveBlob, youtubeLink } from './lib/rawExport';
+import { buildZip, zipEntry, type ZipEntry } from './lib/zipBundle';
 
 // ---------------------------------------------------------------- types
 
@@ -71,6 +72,8 @@ export interface PlanItem {
   caption: string;
   hashtags: string;
   reason: string;
+  /** Deep link to the window's start second — the manual-fallback deliverable. */
+  youtube_url?: string;
 }
 
 export interface PrepPlan {
@@ -102,6 +105,9 @@ interface HistoryEntry {
 
 const HISTORY_KEY = 'heatcut_campaign_history';
 const URL_KEY = 'heatcut_campaign_url';
+
+/** One archive is one download — cap it so the tab never has to hold a huge pack. */
+const ZIP_MAX_BYTES = 1.5 * 1024 * 1024 * 1024;
 
 const fmt = (sec: number): string => {
   const s = Math.max(0, Math.floor(sec || 0));
@@ -138,6 +144,10 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
   const [aiCopy, setAiCopy] = useState(false);
   const [exportingKey, setExportingKey] = useState<string | null>(null);
   const [bulk, setBulk] = useState<{ done: number; total: number } | null>(null);
+  const [bulkZip, setBulkZip] = useState(false);
+  // item id -> why the automatic download failed. Non-empty = that window is
+  // handed over as a MANUAL cut (labeled jump link to the source second).
+  const [manual, setManual] = useState<Record<string, string>>({});
 
   const toast = useCallback((msg: string | null, ms = 3500) => {
     onToast(msg);
@@ -249,6 +259,17 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     }
   };
 
+  const markManual = (key: string, message: string) =>
+    setManual(prev => ({ ...prev, [key]: message }));
+
+  const clearManual = (key: string) =>
+    setManual(prev => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+
   const downloadItem = async (item: PlanItem, quiet = false) => {
     const key = item.id;
     if (exportingKey) return;
@@ -256,9 +277,14 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     try {
       const blob = await fetchRawClip(item.video_id, item.start, item.end, item.source_label);
       saveBlob(blob, `heatcut_${safeFilename(item.source_label)}_${Math.floor(item.start)}-${Math.floor(item.end)}s.mp4`);
+      clearManual(key);
       if (!quiet) toast(null);
     } catch (err) {
-      toast(err instanceof Error ? err.message : c.exportFailed, 5000);
+      // Not a dead end: the window stays in the pack as a MANUAL cut with a
+      // labeled jump link to the exact second.
+      const message = err instanceof Error ? err.message : c.exportFailed;
+      markManual(key, message);
+      toast(c.manualFallback(message), 6000);
     } finally {
       setExportingKey(null);
     }
@@ -268,19 +294,25 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     if (!plan || bulk || exportingKey) return;
     const items = plan.items;
     setBulk({ done: 0, total: items.length });
+    let ok = 0;
+    let failed = 0;
     for (let i = 0; i < items.length; i += 1) {
       setBulk({ done: i, total: items.length });
       try {
         const blob = await fetchRawClip(items[i].video_id, items[i].start, items[i].end, items[i].source_label);
         saveBlob(blob, `heatcut_${safeFilename(items[i].source_label)}_${Math.floor(items[i].start)}-${Math.floor(items[i].end)}s.mp4`);
+        clearManual(items[i].id);
+        ok += 1;
       } catch (err) {
-        toast(`${items[i].timestamp}: ${err instanceof Error ? err.message : c.exportFailed}`, 5000);
-        break;
+        // Keep going: one blocked source must not cancel the rest of the pack.
+        markManual(items[i].id, err instanceof Error ? err.message : c.exportFailed);
+        failed += 1;
       }
       // Give the browser a beat between downloads so it does not drop them.
       await new Promise(r => setTimeout(r, 600));
     }
     setBulk({ done: items.length, total: items.length });
+    toast(c.downloadAllDone(ok, failed), 7000);
     setTimeout(() => setBulk(null), 1200);
   };
 
@@ -305,6 +337,85 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
 
   const evidenceLabel = (key: string) =>
     key === 'campaign-timestamp' ? c.evidenceCampaign : key === 'retention-peak' ? c.evidencePeak : c.evidenceSpread;
+
+  // ------------------------------------------------- manual fallback (403 etc.)
+
+  /** Jump link for a window, from the brief when present, computed otherwise. */
+  const itemLink = (item: PlanItem): string => item.youtube_url || youtubeLink(item.video_id, item.start);
+
+  const manualItems = useMemo(
+    () => (plan?.items || []).filter(i => manual[i.id]),
+    [plan, manual],
+  );
+
+  /** Markdown hand-off for the windows YouTube would not hand over. */
+  const manualListMd = (items: PlanItem[]): string => {
+    if (!items.length) return '';
+    const lines = [`## ${c.manualListTitle}`, '', c.manualHint, ''];
+    items.forEach(i => {
+      lines.push(`- **${i.timestamp}** · ${i.source_label}${i.section_label ? ` · ${i.section_label}` : ''}`);
+      lines.push(`  - ${i.title}`);
+      lines.push(`  - Jump: ${itemLink(i)}`);
+    });
+    lines.push('');
+    return lines.join('\n');
+  };
+
+  const copyManualList = () => copyText(manualListMd(manualItems.length ? manualItems : plan?.items || []), c.manualListCopied);
+
+  const downloadManualList = () => {
+    const md = manualListMd(manualItems.length ? manualItems : plan?.items || []);
+    if (md) saveBlob(new Blob([md], { type: 'text/markdown' }), `heatcut_campaign_${plan?.campaign_id || 'manual'}_manual.md`);
+  };
+
+  // One archive = one download = no "allow multiple downloads" gate. Same fetch
+  // path as the per-clip button, plus BRIEF.md / MANUAL_CUTS.md riding along.
+  const downloadZipAll = async () => {
+    if (!plan || bulk || exportingKey) return;
+    const items = plan.items;
+    const entries: ZipEntry[] = [];
+    const blocked: PlanItem[] = [];
+    let bytes = 0;
+    setBulk({ done: 0, total: items.length });
+    setBulkZip(true);
+    for (let i = 0; i < items.length; i += 1) {
+      setBulk({ done: i, total: items.length });
+      try {
+        const blob = await fetchRawClip(items[i].video_id, items[i].start, items[i].end, items[i].source_label);
+        const entry = await zipEntry(
+          `heatcut_${safeFilename(items[i].source_label)}_${Math.floor(items[i].start)}-${Math.floor(items[i].end)}s.mp4`,
+          blob,
+        );
+        bytes += entry.size;
+        if (bytes > ZIP_MAX_BYTES) {
+          setBulk(null);
+          setBulkZip(false);
+          toast(c.zipTooBig, 8000);
+          return;
+        }
+        entries.push(entry);
+        clearManual(items[i].id);
+      } catch (err) {
+        markManual(items[i].id, err instanceof Error ? err.message : c.exportFailed);
+        blocked.push(items[i]);
+      }
+      await new Promise(r => setTimeout(r, 120));
+    }
+    if (!entries.length) {
+      setBulk(null);
+      setBulkZip(false);
+      toast(c.zipEmpty, 8000);
+      return;
+    }
+    entries.push(await zipEntry('BRIEF.md', new Blob([plan.brief_md], { type: 'text/markdown' })));
+    if (blocked.length) {
+      entries.push(await zipEntry('MANUAL_CUTS.md', new Blob([manualListMd(blocked)], { type: 'text/markdown' })));
+    }
+    saveBlob(buildZip(entries), `heatcut_campaign_${plan.campaign_id || 'pack'}_raw.zip`);
+    setBulk(null);
+    setBulkZip(false);
+    toast(c.zipDone(entries.filter(e => e.name.endsWith('.mp4')).length, blocked.length), 8000);
+  };
 
   // ---------------------------------------------------------------- render help
 
@@ -606,20 +717,99 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
               </button>
               <button
                 type="button"
+                className="form-input"
+                style={{ width: 'auto', padding: '0.45rem 0.85rem', fontSize: '0.78rem', cursor: 'pointer', background: 'transparent' }}
+                onClick={copyManualList}
+                title={c.manualHint}
+              >
+                🔗 {manualItems.length ? c.manualCopyListCount(manualItems.length) : c.manualCopyList}
+              </button>
+              <button
+                type="button"
+                className="form-input"
+                style={{ width: 'auto', padding: '0.45rem 0.85rem', fontSize: '0.78rem', cursor: 'pointer', background: 'transparent' }}
+                onClick={downloadManualList}
+                title={c.manualHint}
+              >
+                📄 {c.manualDownloadList}
+              </button>
+              <button
+                type="button"
                 className="glowing-btn"
                 style={{ padding: '0.45rem 1rem', fontSize: '0.78rem' }}
                 disabled={!plan.items.length || !!bulk || !!exportingKey}
                 onClick={downloadAll}
+                title={c.bulkHint}
               >
-                {bulk ? c.downloadingAll(bulk.done, bulk.total) : `⬇ ${c.downloadAll}`}
+                {bulk && !bulkZip ? c.downloadingAll(bulk.done, bulk.total) : `⬇ ${c.downloadAll}`}
+              </button>
+              <button
+                type="button"
+                className="glowing-btn"
+                style={{ padding: '0.45rem 1rem', fontSize: '0.78rem' }}
+                disabled={!plan.items.length || !!bulk || !!exportingKey}
+                onClick={downloadZipAll}
+                title={c.bulkHint}
+              >
+                {bulk && bulkZip ? c.zippingAll(bulk.done, bulk.total) : `🧩 ${c.zipAll}`}
               </button>
             </div>
           </div>
+
+          <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)' }}>{c.bulkHint}</p>
 
           {!!plan.warnings?.length && (
             <div style={{ padding: '0.65rem 0.85rem', borderRadius: 10, background: 'rgba(251, 191, 36, 0.07)', border: '1px solid rgba(251, 191, 36, 0.28)', fontSize: '0.8rem', color: '#fcd34d' }}>
               <strong>{c.warningsTitle}: </strong>
               {plan.warnings.join(' · ')}
+            </div>
+          )}
+
+          {manualItems.length > 0 && (
+            <div
+              style={{ padding: '0.75rem 0.9rem', borderRadius: 10, background: 'rgba(251, 191, 36, 0.07)', border: '1px solid rgba(251, 191, 36, 0.32)', display: 'flex', flexDirection: 'column', gap: '0.55rem' }}
+            >
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <strong style={{ fontSize: '0.88rem', color: '#fcd34d' }}>⚠️ {c.manualTitle(manualItems.length)}</strong>
+                <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)', maxWidth: 780 }}>{c.manualHint}</span>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                {manualItems.map(item => (
+                  <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap', fontSize: '0.78rem' }}>
+                    <span style={{ fontFamily: 'monospace', fontWeight: 700 }}>{item.timestamp}</span>
+                    <span>{item.source_label}</span>
+                    <a href={itemLink(item)} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontWeight: 600 }}>
+                      🔗 {c.openAtTime} ↗
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => copyText(itemLink(item), c.linkCopied)}
+                      style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontSize: '0.74rem', cursor: 'pointer', textDecoration: 'underline' }}
+                    >
+                      {c.copyLink}
+                    </button>
+                    <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{manual[item.id].slice(0, 140)}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="form-input"
+                  style={{ width: 'auto', padding: '0.4rem 0.8rem', fontSize: '0.75rem', cursor: 'pointer', background: 'transparent' }}
+                  onClick={copyManualList}
+                >
+                  🔗 {c.manualCopyList}
+                </button>
+                <button
+                  type="button"
+                  className="form-input"
+                  style={{ width: 'auto', padding: '0.4rem 0.8rem', fontSize: '0.75rem', cursor: 'pointer', background: 'transparent' }}
+                  onClick={downloadManualList}
+                >
+                  📄 {c.manualDownloadList}
+                </button>
+              </div>
             </div>
           )}
 
@@ -647,7 +837,26 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                       {item.heat != null && (
                         <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>heat {item.heat}</span>
                       )}
+                      {manual[item.id] && (
+                        <span
+                          className="score-badge"
+                          style={{ fontSize: '0.65rem', background: 'rgba(251, 191, 36, 0.14)', color: '#fcd34d' }}
+                          title={manual[item.id]}
+                        >
+                          ⚠️ {c.manualBadge}
+                        </span>
+                      )}
                       <div style={{ display: 'flex', gap: '0.4rem', marginLeft: 'auto' }}>
+                        <a
+                          href={itemLink(item)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="form-input"
+                          style={{ width: 'auto', padding: '0.4rem 0.75rem', fontSize: '0.75rem', textDecoration: 'none', textAlign: 'center' }}
+                          title={itemLink(item)}
+                        >
+                          🔗 {c.openAtTime}
+                        </a>
                         <button
                           type="button"
                           className="form-input"
@@ -663,7 +872,7 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                           disabled={!!exportingKey || !!bulk}
                           onClick={() => downloadItem(item)}
                         >
-                          {exportingKey === item.id ? c.downloading : `⬇ ${c.downloadRaw}`}
+                          {exportingKey === item.id ? c.downloading : manual[item.id] ? `🔁 ${c.retryDownload}` : `⬇ ${c.downloadRaw}`}
                         </button>
                       </div>
                     </div>
@@ -673,6 +882,11 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                       {item.caption && <div style={{ color: 'var(--text-secondary)', marginTop: 2 }}>{item.caption}</div>}
                       {item.hashtags && <div style={{ color: 'var(--primary)', marginTop: 2, fontSize: '0.78rem' }}>{item.hashtags}</div>}
                       <div style={{ color: 'var(--text-muted)', fontSize: '0.72rem', marginTop: 4 }}>{c.whyLabel}: {item.reason}</div>
+                      {manual[item.id] && (
+                        <div style={{ color: '#fcd34d', fontSize: '0.72rem', marginTop: 4 }}>
+                          {c.manualBadge}: {manual[item.id]} · <a href={itemLink(item)} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)' }}>{c.openAtTime} ↗</a>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}

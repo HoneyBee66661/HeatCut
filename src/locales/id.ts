@@ -276,5 +276,29 @@ export const id: Translations = {
     timestampsCopied: "Timestamp",
     copyCopied: "Copy klip",
     exportFailed: "Export gagal",
+    openAtTime: "Buka di detik ini",
+    copyLink: "Copy link",
+    linkCopied: "Link lompat",
+    manualBadge: "potong manual",
+    retryDownload: "Ulangi",
+    manualTitle: (n: number) => `${n} window diblokir dari auto-download — potong manual`,
+    manualHint: "YouTube nolak ambil medianya untuk window ini (403 / bot check). Tiap window tetap bawa link lompat berlabel ke detik persisnya: buka, lalu potong manual di editor, atau ulangi download.",
+    manualListTitle: "Manual cut list",
+    manualCopyList: "Copy manual list",
+    manualCopyListCount: (n: number) => `Copy manual list (${n})`,
+    manualDownloadList: "Manual list .md",
+    manualListCopied: "Manual cut list",
+    manualFallback: (msg: string) => `${msg} — disimpan sebagai potong manual dengan link lompat.`,
+    downloadAllDone: (ok: number, failed: number) =>
+      failed
+        ? `${ok} klip ke-export, ${failed} diblokir — lihat manual cut list.`
+        : `${ok} klip ke-export.`,
+    zipAll: "Zip semua RAW",
+    zippingAll: (done: number, total: number) => `Zip ${done}/${total}...`,
+    zipDone: (clips: number, blocked: number) =>
+      `Pack ke-download sebagai SATU .zip — ${clips} klip + BRIEF.md${blocked ? ` + MANUAL_CUTS.md (${blocked} diblokir)` : ''}.`,
+    zipEmpty: "Nggak ada yang bisa di-zip — semua window diblokir (lihat manual cut list).",
+    zipTooBig: "Pack kegedean buat satu arsip (>1.5 GB) — download klipnya satu-satu.",
+    bulkHint: "\"Download semua\" bikin satu unduhan per klip: browser bisa nanya SEKALI buat izinin multi-download (izinkan, atau pakai \"Zip semua\" yang cuma satu file).",
   }
 };
