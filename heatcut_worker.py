@@ -441,6 +441,46 @@ def _cookiefile() -> str:
     return p if os.path.exists(p) and os.path.getsize(p) > 0 else None
 
 
+def _yt_env_opts() -> dict:
+    """yt-dlp options for the YouTube JS-challenge (n-sig/EJS) era.
+
+    yt-dlp needs an EXTERNAL JavaScript runtime plus the yt-dlp-ejs challenge
+    solver scripts to solve YouTube's signature/`n` challenges. Without them
+    every browser-ish client fails even with a valid logged-in cookies.txt:
+    "The page needs to be reloaded." (web/tv) or "No video formats found!"
+    (web_safari/mweb/android/ios). Measured 2026-09-19: cookies only = 0/4
+    test ids, cookies + node + EJS = 4/4.
+
+    Env overrides: HEATCUT_YT_JS_RUNTIME (default: first of deno/node/bun/
+    quickjs in PATH; "none" disables) and HEATCUT_YT_REMOTE_COMPONENTS
+    (default "ejs:github"; comma-separated, empty disables). Unsupported keys
+    are dropped so an older yt-dlp behaves exactly as before.
+    """
+    out: dict = {}
+    try:
+        from yt_dlp.globals import supported_js_runtimes, supported_remote_components
+
+        want = (os.environ.get("HEATCUT_YT_JS_RUNTIME") or "").strip()
+        if want.lower() == "none":
+            names = []
+        else:
+            names = [want] if want else ["deno", "node", "bun", "quickjs"]
+        runtimes = supported_js_runtimes.value
+        chosen = {n: {} for n in names if n in runtimes and shutil.which(n)}
+        if chosen:
+            out["js_runtimes"] = chosen
+
+        spec = os.environ.get("HEATCUT_YT_REMOTE_COMPONENTS")
+        spec = "ejs:github" if spec is None else spec.strip()
+        comps = {c.strip() for c in spec.split(",") if c.strip()}
+        comps &= set(supported_remote_components.value)
+        if comps:
+            out["remote_components"] = comps
+    except Exception:  # noqa: BLE001 — extraction must never break on this
+        pass
+    return out
+
+
 def _is_botcheck(e: Exception) -> bool:
     low = str(e).lower()
     return "sign in to confirm" in low or ("bot" in low and "cookies" in low)
@@ -460,6 +500,7 @@ def _base_opts():
     cf = _cookiefile()
     if cf:
         opts["cookiefile"] = cf
+    opts.update(_yt_env_opts())
     return opts
 
 

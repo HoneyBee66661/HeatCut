@@ -650,6 +650,49 @@ def get_yt_cookiefile() -> Optional[str]:
     return p if os.path.exists(p) and os.path.getsize(p) > 0 else None
 
 
+def _yt_env_opts() -> dict:
+    """yt-dlp options for the YouTube JS-challenge (n-sig/EJS) era.
+
+    yt-dlp needs an EXTERNAL JavaScript runtime plus the yt-dlp-ejs challenge
+    solver scripts to solve YouTube's signature/`n` challenges. Without them
+    every browser-ish client fails even with a perfectly valid logged-in
+    cookies.txt: "The page needs to be reloaded." (web/tv) or "No video
+    formats found!" (web_safari/mweb/android/ios). Measured on this host
+    2026-09-19: cookies only = 0/4 test ids, cookies + node + EJS = 4/4.
+
+    Env overrides: HEATCUT_YT_JS_RUNTIME (default: the first of
+    deno/node/bun/quickjs found in PATH; "none" disables) and
+    HEATCUT_YT_REMOTE_COMPONENTS (default "ejs:github"; comma-separated,
+    empty string disables).
+
+    Unsupported keys are dropped silently so an older yt-dlp (or none at all)
+    keeps working exactly as before.
+    """
+    out: dict = {}
+    try:
+        from yt_dlp.globals import supported_js_runtimes, supported_remote_components
+
+        want = (os.environ.get("HEATCUT_YT_JS_RUNTIME") or "").strip()
+        if want.lower() == "none":
+            names: List[str] = []
+        else:
+            names = [want] if want else ["deno", "node", "bun", "quickjs"]
+        runtimes = supported_js_runtimes.value
+        chosen = {n: {} for n in names if n in runtimes and shutil.which(n)}
+        if chosen:
+            out["js_runtimes"] = chosen
+
+        spec = os.environ.get("HEATCUT_YT_REMOTE_COMPONENTS")
+        spec = "ejs:github" if spec is None else spec.strip()
+        comps = {c.strip() for c in spec.split(",") if c.strip()}
+        comps &= set(supported_remote_components.value)
+        if comps:
+            out["remote_components"] = comps
+    except Exception as e:  # noqa: BLE001 — extraction must never break on this
+        logger.debug(f"yt-dlp JS runtime/EJS opts unavailable: {e}")
+    return out
+
+
 def _botcheck_message(e: Exception) -> Optional[str]:
     """Maps a yt-dlp bot-check error to a friendly remediation string."""
     s = str(e)
@@ -687,6 +730,7 @@ def fetch_video_metadata(url: str):
         cf = get_yt_cookiefile()
         if cf:
             ydl_opts['cookiefile'] = cf
+        ydl_opts.update(_yt_env_opts())
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -720,6 +764,7 @@ def fetch_video_metadata(url: str):
         cf = get_yt_cookiefile()
         if cf:
             bot_opts['cookiefile'] = cf
+        bot_opts.update(_yt_env_opts())
         with yt_dlp.YoutubeDL(bot_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if info:
@@ -886,6 +931,10 @@ def fetch_transcript_ytdlp(video_id: str) -> List[dict]:
         'proxy': proxy,
         'socket_timeout': 8
     }
+    cf = get_yt_cookiefile()
+    if cf:
+        ydl_opts['cookiefile'] = cf
+    ydl_opts.update(_yt_env_opts())
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
@@ -3039,6 +3088,7 @@ async def export_clip(request: ExportRequest):
         cf = get_yt_cookiefile()
         if cf:
             dl_opts["cookiefile"] = cf
+        dl_opts.update(_yt_env_opts())
 
         def _do_download(opts: Any) -> None:
             with yt_dlp.YoutubeDL(opts) as ydl:
