@@ -13,6 +13,11 @@ where yt-dlp works fine) and gives the web app two superpowers:
     GET /export?video_id=<ID>&start_time=<s>&end_time=<s>[&title=..]
                                  download a clip AS a file (your browser
                                  saves it directly, ready for CapCut)
+    POST /transcript/window      caption text + SRT for a window, transcribed
+                                 LOCALLY with Whisper when the video has no
+                                 captions (needs backend/asr.py + faster-whisper
+                                 next to this script; a bare copy answers
+                                 source=none with a reason)
 
 The web page (even hosted on https://vercel.app) can reach this worker
 because browsers treat http://127.0.0.1 as "potentially trustworthy" —
@@ -22,6 +27,11 @@ just without heatmap/export.
 RUN (on your device, after installing Python 3.10+)
 --------------------------------------------------
     pip install fastapi "uvicorn[standard]" yt-dlp requests
+    # OPTIONAL local transcription (caption text + SRT for videos WITHOUT
+    # captions) — ~0.5 GB of model on first use:
+    #   pip install faster-whisper        (needs backend/asr.py + whisper_runner.py
+    #                                      next to this file; a bare copy just
+    #                                      answers "transcript unavailable")
     # ffmpeg must be installed too (yt-dlp uses it to cut clips):
     #   Windows: winget install ffmpeg      macOS: brew install ffmpeg
     #   Linux:   sudo apt install ffmpeg
@@ -36,6 +46,14 @@ OPTIONAL
                                         export from a browser logged into
                                         YouTube). Default: ./yt_cookies.txt
     PROXY_URL=http://user:pass@host:port  optional residential/ISP proxy
+    HEATCUT_WHISPER_MODEL=small         local transcription model
+                                        (tiny|base|small|medium|large-v3;
+                                        bigger = slower + more accurate —
+                                        tiny/base are unreliable on SUNG audio,
+                                        small is the tested default)
+    HEATCUT_WHISPER_LANGUAGE=en         force a language (default: auto)
+    HEATCUT_ASR_AUDIO_CLIENTS=default,web_safari  player clients mined for the
+                                        audio-only stream (0.8 MB/window)
 
 Export semantics match the server backend exactly: every clip is padded
 with 2s before + 2s after the requested window, cut with stream-copy
@@ -44,6 +62,7 @@ miner when possible (only the needed seconds are downloaded — great for
 long videos) with a full-download fallback.
 """
 
+import asyncio
 import base64
 import json
 import math
@@ -109,6 +128,8 @@ EXPORT_RATE_LIMIT = int(os.environ.get("HEATCUT_WORKER_RATE_LIMIT", "20"))
 HEATMAP_RATE_LIMIT = int(os.environ.get("HEATCUT_WORKER_HEATMAP_LIMIT", "60"))
 MAX_CONCURRENT_EXPORTS = max(1, int(os.environ.get("HEATCUT_WORKER_MAX_CONCURRENCY", "1")))
 EXPORT_BUSY_WAIT = float(os.environ.get("HEATCUT_WORKER_BUSY_WAIT", "25"))
+TRANSCRIPT_RATE_LIMIT = int(os.environ.get("HEATCUT_WORKER_TRANSCRIPT_LIMIT", "120"))
+TRANSCRIPT_BUSY_WAIT = float(os.environ.get("HEATCUT_WORKER_ASR_BUSY_WAIT", "600"))
 
 _rate_lock = threading.Lock()
 _rate_hits = {}  # "kind:ip" -> [timestamps]
@@ -1271,10 +1292,212 @@ def _drive_upload(out_path: str, filename: str):
 # ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
+# ---------------------------------------------------------------- Local ASR
+# Caption text + SRT for a clip window. The SERVER owns the caption ladder
+# (yt-dlp / Supadata) and answers first; this worker is asked only when the
+# server had no transcript — on a cloud deploy the server has no engine, and the
+# worker runs on the machine the browser is on. Transcription itself lives in
+# backend/asr.py (stdlib-only, whisper in a CHILD process: `small` peaks at
+# ~0.6 GB RSS and must not sit inside this long-running worker).
+_ASR_UNSET = object()
+_ASR_MODULE = _ASR_UNSET
+_asr_slot = threading.Semaphore(1)  # one Whisper run at a time on this box
+
+
+def _asr_module():
+    """Import backend/asr.py when present; None for a bare single-file worker."""
+    global _ASR_MODULE
+    if _ASR_MODULE is not _ASR_UNSET:
+        return _ASR_MODULE
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from backend import asr as mod  # type: ignore
+        _ASR_MODULE = mod
+    except Exception:  # noqa: BLE001 — bare copy: no package next to the script
+        try:
+            import asr as mod  # type: ignore
+            _ASR_MODULE = mod
+        except Exception as e:  # noqa: BLE001
+            print(f"[transcript] local ASR unavailable ({str(e)[:120]})", flush=True)
+            _ASR_MODULE = None
+    return _ASR_MODULE
+
+
+def _asr_pick_audio_format(info) -> dict | None:
+    """Best audio-ONLY https stream (m4a/128k) — 1/20 the bytes of muxed HLS."""
+    best, best_score = None, (-1, -1)
+    for fmt in (info or {}).get("formats") or []:
+        if fmt.get("vcodec") not in (None, "none") or fmt.get("acodec") in (None, "none"):
+            continue
+        protocol = str(fmt.get("protocol") or "")
+        if "http" not in protocol or "m3u8" in protocol or not fmt.get("url"):
+            continue
+        score = (1 if str(fmt.get("ext")) in ("m4a", "mp4", "aac") else 0, int(fmt.get("abr") or 0))
+        if score > best_score:
+            best, best_score = fmt, score
+    return best
+
+
+def _asr_audio_clients() -> list:
+    """Player clients that expose an audio-only stream (None = yt-dlp default).
+
+    Measured: `default` offers the audio-only DASH streams (140 m4a) whose
+    fragment ranges serve; `web_safari` (best for VIDEO here) offers muxed HLS
+    only. ~0.8 MB vs ~12 MB per window.
+    """
+    raw = (os.environ.get("HEATCUT_ASR_AUDIO_CLIENTS") or "default,web_safari").strip()
+    out = []
+    for name in (c.strip() for c in raw.split(",")):
+        if name:
+            out.append(None if name == "default" else name)
+    return out or [None]
+
+
+def _ffmpeg_run(cmd: list, timeout: int = 300) -> bool:
+    try:
+        proc = subprocess.run(["ffmpeg", "-y", "-v", "error", *cmd],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _stream_pts_span(path: str, stream: int = 1) -> tuple:
+    """(first, last) packet PTS — the honest content span of a fragment slice."""
+    spec = "v:0" if stream == 0 else "a:0"
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", spec,
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        return (None, None)
+    values = []
+    for line in out.stdout.splitlines():
+        field = line.split(",")[0].strip()
+        if field and field.lower() != "n/a":
+            try:
+                values.append(float(field))
+            except ValueError:
+                continue
+    if not values:
+        return (None, None)
+    return (min(values), max(values))
+
+
+def _ffmpeg_extract_wav(src: str, dst: str, ss: float = 0.0, duration: float = 0.0) -> bool:
+    """16 kHz mono wav. A trim decodes in FULL then seeks with an output-side
+    `-ss`: an input-side seek on a fragment-range m4a slice yields loud but
+    garbled audio (whisper then answers one hallucinated word)."""
+    tail = ["-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"]
+    if ss > 0.05:
+        full = f"{dst}.full.wav"
+        try:
+            if not _ffmpeg_run(["-i", src, *tail, full]):
+                return False
+            cmd = ["-i", full, "-ss", f"{ss:.3f}"]
+            if duration > 0:
+                cmd += ["-t", f"{duration:.3f}"]
+            ok = _ffmpeg_run([*cmd, "-c:a", "pcm_s16le", dst])
+        finally:
+            if os.path.exists(full):
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+        if not ok:
+            return False
+    else:
+        cmd = ["-i", src]
+        if duration > 0:
+            cmd += ["-t", f"{duration:.3f}"]
+        if not _ffmpeg_run([*cmd, *tail, dst]):
+            return False
+    return os.path.exists(dst) and os.path.getsize(dst) > 1000
+
+
+def _asr_audio_wav(video_id: str, cut_start: float, cut_end: float, tmpdir: str) -> str:
+    """Wav of the padded window, starting exactly at `cut_start`.
+
+    Ladder: audio-only DASH fragment range (cheap) → the export ladder's clip
+    with its video stripped (expensive, but proven to serve bytes). Both start
+    at cut_start so the SRT lines up with the exported clip.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    span = max(0.5, float(cut_end) - float(cut_start))
+    wav = os.path.join(tmpdir, "asr.wav")
+    problems = []
+
+    for client in _asr_audio_clients():
+        label = client or "default"
+        try:
+            import yt_dlp  # lazy, like every other yt-dlp use in this worker
+            opts = {"quiet": True, "no_warnings": True, "noprogress": True, "skip_download": True,
+                    **_base_opts()}
+            if client:
+                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            fmt = _asr_pick_audio_format(info)
+            if fmt is None:
+                problems.append(f"{label}: no audio-only stream")
+                continue
+            data, _begin, _end = _download_fmp4_window(fmt, cut_start, cut_end)
+            src = os.path.join(tmpdir, "asr_audio.m4a")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            first, last = _stream_pts_span(src, 1)
+            if first is None or last is None:
+                problems.append(f"{label}: no packet times in the slice")
+                continue
+            if first > cut_start + 1.0 or last < cut_end - 1.0:
+                problems.append(f"{label}: slice covers {first:.1f}-{last:.1f}s, window {cut_start:.1f}-{cut_end:.1f}s")
+                continue
+            if _ffmpeg_extract_wav(src, wav, ss=max(0.0, cut_start - first), duration=span):
+                print(f"[transcript] {video_id} audio via DASH range (client={label}, "
+                      f"{len(data) // 1024} KB)", flush=True)
+                return wav
+            problems.append(f"{label}: audio range could not be decoded")
+        except Exception as e:  # noqa: BLE001 — refused range / bot check / no sidx
+            problems.append(f"{label}: {str(e)[:100]}")
+
+    try:
+        clip = _auto_partial_export(url, tmpdir, cut_start, cut_end)
+        if _ffmpeg_extract_wav(clip, wav, ss=0.0, duration=span):
+            print(f"[transcript] {video_id} audio from the export ladder", flush=True)
+            return wav
+        problems.append("clip carried no decodable audio")
+    except Exception as e:  # noqa: BLE001 — PartialBlocked, ffmpeg failure, ...
+        problems.append(f"clip ladder refused ({str(e)[:110]})")
+
+    raise ValueError("; ".join(problems) or "no audio could be fetched")
+
+
+def _transcript_blocking(video_id: str, start: float, end: float, model: str = "",
+                         language: str = "") -> dict:
+    """Whisper-only transcription of one window (captions are the server's job)."""
+    asr_mod = _asr_module()
+    if asr_mod is None:
+        return {"source": "none", "engine": "", "model": "", "language": "", "lines": [],
+                "text": "", "srt": "", "srt_window": "", "note":
+                "Local Whisper is not available in this worker build (backend/asr.py + "
+                "faster-whisper are needed) — install them or let the app server answer.",
+                "elapsed": 0.0}
+    tmpdir = _new_export_tmp_dir_or_500()
+    try:
+        return asr_mod.window_transcript(
+            video_id, start, end,
+            captions_fn=None, use_captions=False,
+            audio_fn=lambda vid, a, b: _asr_audio_wav(vid, a, b, tmpdir),
+            model=model, language=language, allow_whisper=True)
+    finally:
+        _finish_export_job(tmpdir)
+
+
 @app.middleware("http")
 async def _log_client(request: Request, call_next):
     """Log who is using the shared worker (format + abuse forensics)."""
-    if request.url.path in ("/export", "/heatmap"):
+    if request.url.path in ("/export", "/heatmap", "/transcript/window"):
         print(f"[worker] {request.method} {request.url.path} from {_client_ip(request)}", flush=True)
     return await call_next(request)
 
@@ -1282,7 +1505,11 @@ async def _log_client(request: Request, call_next):
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "heatcut-device-worker", "version": "2.0.0",
-            "export": True, "auth_required": bool(WORKER_TOKEN)}
+            "export": True, "auth_required": bool(WORKER_TOKEN),
+            # Local transcription (the Whisper fallback when a video has no
+            # captions — on a cloud deploy this worker IS the ASR host).
+            "transcript": _asr_module() is not None,
+            "transcript_model": (os.environ.get("HEATCUT_WHISPER_MODEL") or "small")}
 
 
 @app.get("/heatmap")
@@ -1333,6 +1560,55 @@ def export(request: Request, video_id: str, start_time: float, end_time: float, 
         return _export_impl(video_id, start_time, end_time, title, mode=mode)
     finally:
         _export_slots.release()
+
+
+@app.post("/transcript/window")
+async def transcript_window(request: Request):
+    """Local Whisper transcript (caption text + SRT) for ONE clip window.
+
+    Captions are the APP SERVER's job (it has the yt-dlp/Supadata ladder); this
+    endpoint is the LOCAL engine the browser can reach even when the server is a
+    cloud function with no Whisper. Answer shape is identical to the server's
+    `/api/transcript/window` (see backend/asr.py): source, lines (absolute
+    times), text, srt (timed against the exported clip), srt_window, note.
+    """
+    _require_token(request)
+    ip = _client_ip(request)
+    if _rate_limited(f"transcript:{ip}", TRANSCRIPT_RATE_LIMIT):
+        raise HTTPException(status_code=429,
+                            detail=f"Rate limit: maks {TRANSCRIPT_RATE_LIMIT} transcript/jam dari IP ini.")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — malformed body
+        raise HTTPException(status_code=400, detail="A JSON body is required.")
+    video_id = str((body or {}).get("video_id") or "").strip()
+    if not video_id:
+        raise HTTPException(status_code=400, detail="video_id is required.")
+    try:
+        start = float((body or {}).get("start") or 0.0)
+        end = float((body or {}).get("end") or 0.0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="start/end must be numbers.")
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end must be greater than start.")
+    max_window = float(os.environ.get("HEATCUT_WHISPER_MAX_WINDOW", "600"))
+    if end - start > max_window:
+        raise HTTPException(status_code=400,
+                            detail=f"Window too long ({end - start:.0f}s) — max {int(max_window)}s.")
+
+    if not _asr_slot.acquire(timeout=TRANSCRIPT_BUSY_WAIT):
+        raise HTTPException(status_code=429,
+                            detail="Worker sedang mentranskripsi window lain — coba lagi sebentar.")
+    try:
+        result = await asyncio.to_thread(
+            _transcript_blocking, video_id, start, end,
+            str((body or {}).get("model") or ""), str((body or {}).get("language") or ""))
+    finally:
+        _asr_slot.release()
+    result["video_id"] = video_id
+    print(f"[transcript] {video_id} {start:.1f}-{end:.1f}s -> {result.get('source')} "
+          f"({len(result.get('lines') or [])} lines, {result.get('elapsed')}s)", flush=True)
+    return result
 
 
 def _export_impl(video_id: str, start_time: float, end_time: float, title: str = "",
@@ -1415,6 +1691,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print(f"HeatCut device worker on http://{HOST}:{PORT} "
-          f"(heatmap + export, cookies={'yes' if _cookiefile() else 'no'}, "
-          f"drive-mirror={'yes' if DRIVE_FOLDER_ID else 'no'})")
+          f"(heatmap + export + transcript, cookies={'yes' if _cookiefile() else 'no'}, "
+          f"drive-mirror={'yes' if DRIVE_FOLDER_ID else 'no'}, "
+          f"whisper={'on' if _asr_module() is not None else 'off'})")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

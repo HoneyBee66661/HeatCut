@@ -7,7 +7,9 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        // HEATCUT_API_TARGET points the dev proxy at a STUB api for UI tests
+        // (scripts/campaign_captions_history_e2e.py); default = local backend.
+        target: process.env.HEATCUT_API_TARGET || 'http://localhost:8000',
         changeOrigin: true,
       }
     }
