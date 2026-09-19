@@ -486,6 +486,99 @@ def _is_botcheck(e: Exception) -> bool:
     return "sign in to confirm" in low or ("bot" in low and "cookies" in low)
 
 
+# ------------------------------------------------------------------
+# Which player client actually SERVES MEDIA (not just extracts)
+# ------------------------------------------------------------------
+# Extraction succeeding is not proof the media is fetchable. Measured from this
+# host 2026-09-19 with a live logged-in jar + JS runtime + EJS: `default` and
+# `mweb` handed back signed URLs that 403 on the FIRST byte, while `web_safari`
+# served the same window fine (range GET 206) — the miner AND the full-download
+# fallback both died on those 403s even though `yt-dlp --simulate` looked
+# perfect. So the export PICKS a client by probing the URL, never by trusting
+# extraction. Order is overridable: HEATCUT_YT_EXPORT_CLIENTS="web_safari,default".
+DEFAULT_EXPORT_CLIENTS = "web_safari,default"
+
+
+def _yt_export_clients() -> list:
+    raw = (os.environ.get("HEATCUT_YT_EXPORT_CLIENTS") or DEFAULT_EXPORT_CLIENTS).strip()
+    out = [c.strip() for c in raw.split(",") if c.strip()]
+    if "default" not in out:
+        out.append("default")  # keep the historical behaviour as the last resort
+    return out
+
+
+def _media_url_ok(fmt: dict, timeout: int = 20) -> bool:
+    """1 KB range GET on a format's media URL: is it actually served?
+
+    Same client + `http_headers` as the miner (`_download_fmp4_window`), so the
+    probe cannot pass where the real fetch would fail.
+    """
+    import requests as _rq
+    url = (fmt or {}).get("url")
+    if not url:
+        return False
+    try:
+        r = _rq.get(url, headers={**(fmt.get("http_headers") or {}), "Range": "bytes=0-1023"},
+                    timeout=timeout)
+        return r.status_code in (200, 206)
+    except Exception:  # noqa: BLE001 — any refusal/error means "not usable"
+        return False
+
+
+def _miner_pick_pair(formats: list):
+    """The (video, audio) DASH pair the fragment miner will cut (height<=1080)."""
+    vfmt, v_h = None, -1
+    for f in formats or []:
+        if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
+                and f.get("protocol") == "https" and f.get("ext") == "mp4"
+                and f.get("url") and 0 < (f.get("height") or 0) <= 1080
+                and (f.get("height") or 0) > v_h):
+            vfmt, v_h = f, f.get("height") or 0
+    afmt, a_b = None, -1.0
+    for f in formats or []:
+        if (f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+                and f.get("protocol") == "https" and f.get("ext") in ("m4a", "mp4")
+                and f.get("url") and (f.get("tbr") or f.get("abr") or 0) > a_b):
+            afmt, a_b = f, f.get("tbr") or f.get("abr") or 0
+    return vfmt, afmt
+
+
+def _extract_info_for_export(url: str):
+    """Extract, preferring a client whose media URLs are actually served.
+
+    Returns (info, client): client is None for the default (no override), else
+    the name to pin via extractor_args on the full-download fallback. Walks
+    _yt_export_clients(), probing the miner's video AND audio URLs with a 1 KB
+    range GET and stopping at the first client that serves bytes. When no client
+    serves bytes the last successful extraction is returned anyway, so the user
+    sees the real downstream error instead of a probe message.
+    """
+    import yt_dlp
+    last = None
+    for name in _yt_export_clients():
+        opts = _base_opts()
+        opts["skip_download"] = True
+        if name and name != "default":
+            opts["extractor_args"] = {"youtube": {"player_client": [name]}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:  # noqa: BLE001 — try the next client
+            print(f"[export] player_client={name}: extraction failed ({str(e)[:110]})", flush=True)
+            continue
+        pinned = None if (not name or name == "default") else name
+        if last is None:
+            last = (info, pinned)
+        vfmt, afmt = _miner_pick_pair((info or {}).get("formats") or [])
+        if vfmt and afmt and _media_url_ok(vfmt) and _media_url_ok(afmt):
+            print(f"[export] using player_client={name} (media URLs serve bytes)", flush=True)
+            return info, pinned
+        print(f"[export] player_client={name}: media URLs refused — next client", flush=True)
+    if last is None:
+        raise ValueError("no player client could extract this video")
+    return last
+
+
 def _base_opts():
     opts = {
         "quiet": True,
@@ -653,7 +746,7 @@ def _extract_info_yt(url: str) -> dict:
         if not _is_botcheck(e):
             raise
         retry = dict(opts)
-        retry["extractor_args"] = {"youtube": ["player_client=tv,android"]}
+        retry["extractor_args"] = {"youtube": {"player_client": ["tv", "android"]}}
         with yt_dlp.YoutubeDL(retry) as ydl:
             return ydl.extract_info(url, download=False)
 
@@ -696,26 +789,15 @@ def _first_pts(path: str, stream: int) -> float | None:
     return None
 
 
-def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) -> str:
-    info = _extract_info_yt(url)
+def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float,
+                       info=None) -> str:
+    # `info` is normally extracted by _extract_info_for_export (which already
+    # picked a client whose media URLs serve bytes) so the URLs and the client
+    # stay consistent between the miner and the full-download fallback.
+    if info is None:
+        info, _client = _extract_info_for_export(url)
     formats = (info or {}).get("formats") or []
-    vfmt = None
-    v_h = -1
-    for f in formats:
-        if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
-                and f.get("protocol") == "https" and f.get("ext") == "mp4"
-                and f.get("url") and 0 < (f.get("height") or 0) <= 1080
-                and (f.get("height") or 0) > v_h):
-            vfmt = f
-            v_h = f.get("height") or 0
-    afmt = None
-    a_b = -1.0
-    for f in formats:
-        if (f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
-                and f.get("protocol") == "https" and f.get("ext") in ("m4a", "mp4")
-                and f.get("url") and (f.get("tbr") or f.get("abr") or 0) > a_b):
-            afmt = f
-            a_b = f.get("tbr") or f.get("abr") or 0
+    vfmt, afmt = _miner_pick_pair(formats)
     if not vfmt or not afmt:
         raise ValueError("no https DASH video+audio pair with sidx")
     v_fmp4 = os.path.join(tmpdir, "v_part.mp4")
@@ -775,7 +857,8 @@ def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float) 
     return merged  # fragment-aligned superset of [cut_start, cut_end]
 
 
-def _legacy_full_export(url: str, tmpdir: str, cut_start: float, cut_end: float) -> str:
+def _legacy_full_export(url: str, tmpdir: str, cut_start: float, cut_end: float,
+                        client=None) -> str:
     """Full download + local stream-copy cut (with re-encode fallback)."""
     import yt_dlp
     dur = cut_end - cut_start
@@ -786,18 +869,47 @@ def _legacy_full_export(url: str, tmpdir: str, cut_start: float, cut_end: float)
         "merge_output_format": "mp4",
         "outtmpl": os.path.join(tmpdir, "src.%(ext)s"),
     })
+    if client:
+        # Pin the client whose media URLs the probe showed to be served — the
+        # DEFAULT client's URLs 403 on some videos even with a live jar.
+        opts["extractor_args"] = {"youtube": {"player_client": [client]}}
 
     def _do(opts_):
         with yt_dlp.YoutubeDL(opts_) as ydl:
             ydl.download([url])
 
-    try:
-        _do(opts)
-    except Exception as e:
-        if _is_botcheck(e):
-            _do({**opts, "extractor_args": {"youtube": ["player_client=tv,android"]}})
-        else:
-            raise
+    # Ladder: the pinned client first (its media URLs probed OK), then the rest.
+    # A media 403 ("unable to download video data: HTTP Error 403") is NOT a
+    # bot-check string, so the old tv/android retry never fired for it — this
+    # loop is what actually recovers from a refused media URL.
+    attempts = [client] if client else ["default"]
+    for c in _yt_export_clients():
+        if c not in attempts:
+            attempts.append(c)
+
+    err = None
+    for name in attempts:
+        o = dict(opts)
+        if name and name != "default":
+            o["extractor_args"] = {"youtube": {"player_client": [name]}}
+        try:
+            _do(o)
+            err = None
+            break
+        except Exception as e:  # noqa: BLE001 — try the next client
+            err = e
+            if _is_botcheck(e):
+                try:
+                    _do({**o, "extractor_args": {"youtube": {"player_client": ["tv", "android"]}}})
+                    err = None
+                    break
+                except Exception as e2:  # noqa: BLE001
+                    err = e2
+            print(f"[export] full download via player_client={name or 'default'} "
+                  f"failed ({str(err)[:110]})", flush=True)
+            _clear_export_artifacts(tmpdir)
+    if err is not None:
+        raise err
     src = None
     for f in sorted(os.listdir(tmpdir)):
         if f.startswith("src."):
@@ -975,15 +1087,20 @@ def _export_impl(video_id: str, start_time: float, end_time: float, title: str =
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     try:
+        # Pick the client whose media URLs are actually served BEFORE spending a
+        # download on them (default/mweb can 403 with a live jar; web_safari
+        # serves the same window). `info` is reused by the miner so both paths
+        # use URLs from the SAME client.
+        info, client = _extract_info_for_export(url)
         try:
-            out = _frag_miner_export(url, tmpdir, cut_start, cut_end)
+            out = _frag_miner_export(url, tmpdir, cut_start, cut_end, info=info)
             out_dur = _probe_duration(out)
             if not (out_dur >= dur * 0.9 and out_dur <= dur + 25.0):
                 raise ValueError(f"miner duration mismatch ({out_dur:.1f}s vs {dur:.1f}s)")
         except Exception as e:
             print(f"[export] fragment miner failed ({str(e)[:120]}) - full download fallback", flush=True)
             _clear_export_artifacts(tmpdir)
-            out = _legacy_full_export(url, tmpdir, cut_start, cut_end)
+            out = _legacy_full_export(url, tmpdir, cut_start, cut_end, client=client)
     except Exception as e:
         _finish_export_job(tmpdir)
         hint = ("YouTube blocked this download as a bot check. Export a cookies.txt "
