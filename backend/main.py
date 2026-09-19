@@ -683,8 +683,10 @@ def _media_url_ok(fmt: dict, timeout: int = 20) -> bool:
     if not url:
         return False
     try:
-        r = _rq.get(url, headers={**(fmt.get("http_headers") or {}), "Range": "bytes=0-1023"},
-                    timeout=timeout)
+        # Retried: a fresh googlevideo URL 403s for ~2 s after extraction, and a
+        # single-shot GET read that as "DASH is blocked" for a whole session.
+        r = _media_get(url, fmt.get("http_headers") or {}, "bytes=0-1023",
+                       timeout=timeout, attempts=3)
         return r.status_code in (200, 206)
     except Exception:  # noqa: BLE001 — any refusal/error means "not usable"
         return False
@@ -1587,6 +1589,275 @@ def _heatmap_peaks(heatmap: List[dict], duration: float, target_secs: float,
     return picks
 
 
+# ------------------------------------------------------------------
+# Partial-export ladder — DASH ranges first, then HLS segments
+# ------------------------------------------------------------------
+# Measured on this host 2026-09-19 (numbers kept in the cheat-clip-webapp skill):
+#   * A freshly issued googlevideo URL refuses EVERY request for ~2 s after
+#     extraction (403 at +0/+0.3/+1 s, 206 at +2 s; sleeping 3.5 s before the
+#     first request answers 206 immediately) — so a single-shot GET looks
+#     exactly like a hard block while the URL is merely not warm yet.
+#   * Past the edge-cached prefix, byte RANGE requests are refused for good
+#     (1.1 GB video: 0-13 MB served, >=14 MB 403; 116 MB video: 20 MB 403), so
+#     a window deep inside a long source can never be mined by range.
+#   * HLS segment URLs are whole resources (no Range header) and ARE served —
+#     why the segment path is the dependable cheap route.
+MEDIA_GET_ATTEMPTS = 4
+MEDIA_GET_BACKOFF = 1.2
+
+# Full-video route throughput measured here: 1128 MB in ~80 s.
+FULL_EXPORT_MB_PER_SEC = 14.0
+
+
+def _media_get(url: str, headers: dict, range_header: Optional[str] = None,
+               timeout: int = 60, attempts: int = MEDIA_GET_ATTEMPTS):
+    """GET a media URL, retrying the 403s a fresh googlevideo URL answers with.
+
+    Only 403/429/5xx are retried; everything else is handed back as-is.
+    """
+    import requests as _rq
+    h: Any = dict(headers or {})
+    if range_header:
+        h["Range"] = range_header
+    last: Any = None
+    tries = max(1, attempts)
+    for attempt in range(tries):
+        try:
+            r = _rq.get(url, headers=h, timeout=timeout)
+        except Exception as e:  # noqa: BLE001 — transient network/refusal
+            last = e
+        else:
+            if r.status_code not in (403, 429) and r.status_code < 500:
+                return r
+            last = r
+        if attempt + 1 < tries:
+            time.sleep(MEDIA_GET_BACKOFF)
+    if isinstance(last, Exception):
+        raise last
+    return last
+
+
+class PartialBlocked(Exception):
+    """Both cheap partial paths were refused — the API answers 409 instead."""
+
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+        self.est_seconds = 90
+
+
+def _looks_like_botcheck(text: str) -> bool:
+    low = (text or "").lower()
+    return "sign in to confirm" in low or "bot" in low or "cookies" in low
+
+
+def _hls_clients() -> List[str]:
+    raw = (os.environ.get("HEATCUT_YT_HLS_CLIENTS") or "web_safari").strip()
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def _hls_pick_format(formats: List[dict]):
+    """Best MUXED HLS (m3u8) format <=1080p — HLS here carries video AND audio."""
+    best, best_h = None, -1
+    for f in formats or []:
+        if not f.get("url") or "m3u8" not in str(f.get("protocol") or ""):
+            continue
+        if f.get("vcodec") in (None, "none") or f.get("acodec") in (None, "none"):
+            continue
+        h = f.get("height") or 0
+        if 0 < h <= 1080 and h > best_h:
+            best, best_h = f, h
+    return best
+
+
+def _hls_servable_format(url: str):
+    """Extract with an HLS-capable player client; return its best HLS format."""
+    import yt_dlp
+    err: Any = None
+    for name in _hls_clients():
+        opts: Any = {
+            "quiet": True, "no_warnings": True, "noprogress": True,
+            "socket_timeout": 15, "retries": 2, "skip_download": True,
+            **_yt_env_opts(),
+        }
+        cf = get_yt_cookiefile()
+        if cf:
+            opts["cookiefile"] = cf
+        if name and name != "default":
+            opts["extractor_args"] = {"youtube": {"player_client": [name]}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:  # noqa: BLE001 — try the next client
+            err = e
+            logger.info(f"[export] HLS client={name}: extraction failed ({str(e)[:110]})")
+            continue
+        fmt = _hls_pick_format((info or {}).get("formats") or [])
+        if fmt:
+            return fmt
+    raise ValueError(f"no HLS format available ({str(err)[:110]})" if err else "no HLS format available")
+
+
+def _hls_segment_export(fmt: dict, tmpdir: str, cut_start: float, cut_end: float) -> str:
+    """Fetch ONLY the HLS segments covering [cut_start, cut_end], then cut.
+
+    Segment URLs are standalone resources (no Range header), which is what gets
+    around both 403 modes that stop the DASH range miner.
+    """
+    from bisect import bisect_left, bisect_right
+    from urllib.parse import urljoin
+
+    headers = dict(fmt.get("http_headers") or {})
+    playlist = _media_get(fmt["url"], headers, None, timeout=90, attempts=3)
+    if playlist.status_code not in (200, 206):
+        raise ValueError(f"HLS playlist fetch failed (HTTP {playlist.status_code})")
+    text = playlist.text
+    if "#EXTINF" not in text:
+        # A master playlist points at variants — follow the first one.
+        variant = next((l.strip() for l in text.splitlines()
+                        if l.strip() and not l.strip().startswith("#")), None)
+        if not variant:
+            raise ValueError("HLS master playlist without variants")
+        playlist = _media_get(urljoin(fmt["url"], variant), headers, None, timeout=90, attempts=3)
+        if playlist.status_code not in (200, 206):
+            raise ValueError(f"HLS variant fetch failed (HTTP {playlist.status_code})")
+        text = playlist.text
+    if "#EXT-X-KEY" in text and "METHOD=NONE" not in text:
+        raise ValueError("encrypted HLS playlist")
+
+    segs: List[str] = []
+    durs: List[float] = []
+    pending: Optional[float] = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTINF:"):
+            try:
+                pending = float(line.split(":", 1)[1].split(",")[0])
+            except (ValueError, IndexError):
+                pending = None
+            continue
+        if line.startswith("#") or pending is None:
+            continue
+        segs.append(urljoin(fmt["url"], line))
+        durs.append(pending)
+        pending = None
+    if not segs or sum(durs) <= 0:
+        raise ValueError("no usable HLS segments in playlist")
+
+    bounds = [0.0]
+    for d in durs:
+        bounds.append(bounds[-1] + d)
+    i0 = max(0, bisect_right(bounds, cut_start) - 1)
+    i1 = min(len(segs) - 1, bisect_left(bounds, cut_end))
+    if bounds[i1 + 1] <= cut_start:
+        raise ValueError("clip window beyond the playlist end")
+    # No headroom segments: the cut below is exact (-ss inside the first segment,
+    # -t for the window), and every HLS segment starts on a keyframe — so the
+    # segment list is just the window's coverage, which keeps the transfer small.
+
+    parts: List[str] = []
+    for idx in range(i0, i1 + 1):
+        seg = _media_get(segs[idx], headers, None, timeout=180)
+        if seg.status_code not in (200, 206) or not seg.content:
+            raise ValueError(f"HLS segment {idx} refused (HTTP {seg.status_code})")
+        part = os.path.join(tmpdir, f"hls_{idx:05d}.ts")
+        with open(part, "wb") as fh:
+            fh.write(seg.content)
+        parts.append(part)
+
+    joined = os.path.join(tmpdir, "hls_all.ts")
+    with open(joined, "wb") as out:
+        for part in parts:
+            with open(part, "rb") as fh:
+                shutil.copyfileobj(fh, out, 1 << 20)
+
+    seg_start = bounds[i0]
+    dur = cut_end - cut_start
+    ss = max(0.0, cut_start - seg_start)
+    out_mp4 = os.path.join(tmpdir, "clip.mp4")
+    cmd = ["ffmpeg", "-y", "-ss", f"{ss:.3f}", "-i", joined, "-t", f"{dur:.3f}",
+           "-c", "copy", "-avoid_negative_ts", "make_zero", "-map", "0", out_mp4]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    if proc.returncode != 0 or not os.path.exists(out_mp4) or os.path.getsize(out_mp4) == 0:
+        cmd2 = ["ffmpeg", "-y", "-ss", f"{ss:.3f}", "-i", joined, "-t", f"{dur:.3f}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-c:a", "aac", "-b:a", "128k", "-map", "0", out_mp4]
+        proc2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=1800)
+        if proc2.returncode != 0 or not os.path.exists(out_mp4) or os.path.getsize(out_mp4) == 0:
+            raise ValueError(f"ffmpeg cut failed: {(proc2.stderr or proc.stderr or 'unknown')[-200:]}")
+    logger.info(f"[export] HLS segments {i0}-{i1}/{len(segs)} "
+                f"({sum(durs[i0:i1 + 1]):.1f}s of media, {len(parts)} files) → clip.mp4")
+    return out_mp4
+
+
+def _probe_duration(path: str) -> float:
+    """Container duration in seconds (0.0 when ffprobe cannot tell)."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "csv=p=0", path], capture_output=True, text=True, timeout=60)
+        return float(out.stdout.strip())
+    except (ValueError, subprocess.SubprocessError):
+        return 0.0
+
+
+def _auto_partial_export(url: str, tmpdir: str, cut_start: float, cut_end: float,
+                         info: Any = None) -> str:
+    """Cheapest partial path that works: DASH range mining, else HLS segments.
+
+    Raises `PartialBlocked` when both are refused, so the API can answer with the
+    user-facing choice (whole video vs direct download) instead of a hard error.
+    """
+    dur = cut_end - cut_start
+    errors: List[str] = []
+
+    if info is not None:
+        try:
+            mined = _frag_miner_export(url, tmpdir, cut_start, cut_end, info=info)
+            out_dur = _probe_duration(mined)
+            if out_dur >= dur * 0.9 and out_dur <= dur + 25.0:
+                return mined
+            raise ValueError(f"miner output duration mismatch ({out_dur:.1f}s vs {dur:.1f}s)")
+        except Exception as e:  # noqa: BLE001 — fall through to the HLS path
+            errors.append(f"dash-range: {str(e)[:110]}")
+            _clear_export_artifacts(tmpdir)
+            logger.info(f"[export] DASH range miner refused ({str(e)[:110]}) — trying HLS segments")
+    else:
+        errors.append("dash-range: no extraction")
+
+    try:
+        hls_fmt = _hls_servable_format(url)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"hls-playlist: {str(e)[:110]}")
+    else:
+        try:
+            out = _hls_segment_export(hls_fmt, tmpdir, cut_start, cut_end)
+            out_dur = _probe_duration(out)
+            if out_dur >= dur * 0.9:
+                return out
+            raise ValueError(f"HLS output too short ({out_dur:.1f}s vs {dur:.1f}s)")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"hls-segments: {str(e)[:110]}")
+            _clear_export_artifacts(tmpdir)
+
+    joined = " | ".join(errors)
+    raise PartialBlocked("yt_bot_check" if _looks_like_botcheck(joined) else "yt_partial_blocked", joined)
+
+
+def _estimate_full_seconds(info: Any) -> int:
+    """Rough ETA for the whole-video route — the UI counts this down."""
+    try:
+        secs = float((info or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        secs = 0.0
+    size_mb = secs * 0.6            # 1080p ≈ 4.8 Mbps
+    if size_mb <= 0:
+        return 90
+    return int(max(25, min(900, size_mb / FULL_EXPORT_MB_PER_SEC + 8)))
+
+
 # ----------------------------------------------------------------
 # DASH fragment-range miner — TRUE partial downloads for long sources
 # ----------------------------------------------------------------
@@ -1649,8 +1920,9 @@ def _download_fmp4_window(fmt: dict, t0: float, t1: float) -> tuple:
     headers = dict(fmt.get("http_headers") or {})
     # 1) Header: ftyp+moov+sidx. Fragmented-DASH moovs are tiny (no sample
     #    tables); sidx grows ~12 B/fragment (a 3.5h video ≈ 25 KB), so a
-    #    128 KB head fetch covers both comfortably.
-    head = _rq.get(fmt["url"], headers={**headers, "Range": "bytes=0-131071"}, timeout=60)
+    #    128 KB head fetch covers both comfortably. Retried: a fresh googlevideo
+    #    URL 403s on everything for ~2 s after extraction (measured).
+    head = _media_get(fmt["url"], headers, "bytes=0-131071", timeout=60)
     if head.status_code not in (200, 206) or len(head.content) < 1024:
         raise ValueError(f"fMP4 header fetch failed (HTTP {head.status_code})")
     buf = head.content
@@ -1694,8 +1966,7 @@ def _download_fmp4_window(fmt: dict, t0: float, t1: float) -> tuple:
         raise ValueError(f"invalid byte range {total}")
 
     # 3) Single ranged GET for the whole window slice
-    rng = _rq.get(fmt["url"], headers={**headers, "Range": f"bytes={start_byte}-{end_byte - 1}"},
-                  timeout=180)
+    rng = _media_get(fmt["url"], headers, f"bytes={start_byte}-{end_byte - 1}", timeout=180)
     if rng.status_code != 206:
         raise ValueError(f"fMP4 range fetch failed (HTTP {rng.status_code})")
     media = rng.content
@@ -3226,6 +3497,11 @@ class ExportRequest(BaseModel):
     start_time: float = Field(..., ge=0, description="Clip start in seconds")
     end_time: float = Field(..., gt=0, description="Clip end in seconds")
     title: Optional[str] = Field(default=None, description="Optional video title used for the download filename")
+    mode: Optional[str] = Field(default=None,
+                                description="'auto' = cheapest partial download (DASH ranges then HLS "
+                                            "segments), 409 with {code, est_seconds, source_url} when both "
+                                            "are refused; 'full' = whole-video download + cut (heavy). "
+                                            "Omitted = legacy behaviour (partial, then whole video).")
 
 
 @app.post("/api/export")
@@ -3246,6 +3522,15 @@ async def export_clip(request: ExportRequest):
         raise HTTPException(status_code=400, detail="end_time must be greater than start_time.")
     if request.end_time - request.start_time > 3600:
         raise HTTPException(status_code=400, detail="Clip too long (max 60 minutes).")
+
+    # "auto" = cheapest partial route the server can find (DASH ranges → HLS
+    # segments) and a 409 when both are refused; "full" = whole-video download +
+    # cut, only on explicit request; "legacy" (no mode sent) = an older frontend
+    # that cannot render the choice, so keep today's behaviour: partial first,
+    # then the whole-video download on refusal.
+    mode = (request.mode or "legacy").strip().lower()
+    if mode not in ("auto", "full", "legacy"):
+        mode = "legacy"
 
     # ── Context padding (±2s) for the editing-phase finish ───────────────
     pad_pre = 2.0
@@ -3282,42 +3567,34 @@ async def export_clip(request: ExportRequest):
         except Exception as e:  # noqa: BLE001 — the miner/legacy path will report
             logger.warning(f"[export] client probe failed ({str(e)[:120]}) — using defaults")
 
-        # ── Fast path: DASH fragment-range miner ─────────────────────────
-        # True partial transfer: fetch only the fragments overlapping the
-        # padded clip window (see _frag_miner_export). Falls back silently
-        # to the full download below on ANY failure (no sidx, odd codecs,
-        # bot-check, ffmpeg hiccup, ...). Wasted bytes on failure ≈ the
-        # window slice only — never a second full download.
-        # Skipped outright when the probe only found an HLS pair: mining needs a
-        # single range-able DASH file, so trying would just burn a request.
-        try:
-            if plan and plan.get("kind") != "dash":
-                raise ValueError(f"only {plan.get('kind')} media served — fragment miner not applicable")
-            mined = _frag_miner_export(url, tmpdir, cut_start, cut_end, info=info)
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", mined],
-                capture_output=True, text=True, timeout=60)
+        # ── Auto path: cheapest partial download that works ──────────────
+        # DASH range mining first (single range-able fMP4 pairs), then HLS
+        # segments (whole-resource segment URLs, which is what survives the
+        # edge prefix cap that kills range requests deep into a long source).
+        # See _auto_partial_export for the measured 403 modes behind this.
+        if mode in ("auto", "legacy"):
             try:
-                out_dur = float(probe.stdout.strip())
-            except ValueError:
-                out_dur = 0.0
-            # Superset semantics: the fragment cut must COVER the whole
-            # padded window (never less), with headroom bounded by ~1 video
-            # fragment per side (≈ +2-15s). Anything outside → legacy path.
-            if out_dur >= dur * 0.9 and out_dur <= dur + 25.0:
-                logger.info(f"Fragment-miner export OK — {out_dur:.1f}s covers {dur:.1f}s window.")
-                return mined
-            raise ValueError(f"miner output duration mismatch ({out_dur:.1f}s vs window {dur:.1f}s)")
-        except Exception as e:
-            logger.warning(f"Fragment-miner export failed ({str(e)[:120]}) — falling back to full download.")
-            _clear_export_artifacts(tmpdir)
+                out = _auto_partial_export(url, tmpdir, cut_start, cut_end, info=info)
+            except PartialBlocked as pb:
+                pb.est_seconds = _estimate_full_seconds(info)
+                if mode == "auto":
+                    # New frontend: it renders the user's choice (whole video with
+                    # an ETA, or download the source) instead of burning the whole
+                    # download unnoticed.
+                    raise
+                logger.info("[export] partial routes refused — legacy client, "
+                            "keeping the full-download fallback")
+                _clear_export_artifacts(tmpdir)
+            else:
+                logger.info(f"Partial export OK — {out} covers the {dur:.1f}s window.")
+                return out
 
-        # ── Fallback: full DASH download + local stream-copy cut ─────────
-        # Used when the fragment miner cannot run (no sidx, unsupported
-        # codec pair, bot-check during extraction, merge/trim failure).
-        # Correct but heavy for long sources — downloads the WHOLE video
-        # before cutting.
+        # ── whole-video download + local stream-copy cut (below) ──────────
+
+        # ── mode == "full": whole-video download + local stream-copy cut ──
+        # Explicit opt-in only (the UI asks first). Used when the partial paths
+        # are refused, or when the user chose it. Correct but heavy for long
+        # sources — downloads the WHOLE video before cutting.
         dl_opts: Any = {
             "format": "bv*[height<=?1080]+ba/b[height<=?1080]/b",
             "merge_output_format": "mp4",
@@ -3413,6 +3690,20 @@ async def export_clip(request: ExportRequest):
 
     try:
         out_mp4 = await asyncio.to_thread(_run)
+    except PartialBlocked as pb:
+        # Not an error: both cheap partial routes are refused for this video, so
+        # the UI offers the honest choice (whole video with an ETA, or download
+        # the source yourself) instead of silently downloading 100s of MB.
+        _finish_export_job(tmpdir)
+        raise HTTPException(status_code=409, detail={
+            "code": pb.code,
+            "est_seconds": getattr(pb, "est_seconds", 90),
+            "source_url": f"https://www.youtube.com/watch?v={request.video_id}"
+                          f"&t={int(max(0.0, request.start_time))}s",
+            "message": ("YouTube refused our request to fetch only part of this video — "
+                        "the clip can still be produced from the whole video."),
+            "reason": pb.detail[:300],
+        }) from pb
     except Exception as e:  # noqa: BLE001 — surface a clean API error to the client
         _finish_export_job(tmpdir)
         friendly = _botcheck_message(e)

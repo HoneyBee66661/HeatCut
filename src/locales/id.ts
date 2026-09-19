@@ -300,5 +300,22 @@ export const id: Translations = {
     zipEmpty: "Nggak ada yang bisa di-zip — semua window diblokir (lihat manual cut list).",
     zipTooBig: "Pack kegedean buat satu arsip (>1.5 GB) — download klipnya satu-satu.",
     bulkHint: "\"Download semua\" bikin satu unduhan per klip: browser bisa nanya SEKALI buat izinin multi-download (izinkan, atau pakai \"Zip semua\" yang cuma satu file).",
+  },
+  exportFallback: {
+    title: "Klip ini belum bisa dipotong otomatis",
+    reasonPartialBlocked:
+      "YouTube nolak permintaan kami buat ambil sebagian video ini. Sebagian video cuma boleh diambil utuh — klipnya tetap bisa jadi, cuma harus diambil dari video penuh.",
+    reasonBotCheck:
+      "YouTube minta verifikasi manusia buat video ini dari server kami. Ambil video penuh biasanya masih jalan.",
+    reasonUnknown: "Permintaan ambil sebagian video ini ditolak.",
+    downloadSource: "Download source langsung",
+    processFull: (secs: number) => `⚙ Proses video penuh — ~${secs}s`,
+    processingIn: (secs: number) => `Lagi proses video penuh… sisa sekitar ${secs}s. Tab ini boleh dibiarkan kebuka.`,
+    processingInShort: (secs: number) => `⚙ Proses… ~${secs}s`,
+    finishing: "Hampir selesai — lagi nyambungin klipnya…",
+    cancel: "Batal",
+    close: "Nanti aja",
+    failed: (msg: string) => `Gagal: ${msg}`,
+    failedFallback: "Jalur video penuh juga ditolak.",
   }
 };

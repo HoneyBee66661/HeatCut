@@ -1,6 +1,8 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useLanguage } from './locales';
-import { fetchRawClip, safeFilename, saveBlob, youtubeLink } from './lib/rawExport';
+import { fetchRawClip, requestRawClip, safeFilename, saveBlob, youtubeLink } from './lib/rawExport';
+import { ExportFallbackPanel } from './components/ExportFallbackPanel';
+import type { ExportFallbackTarget } from './components/ExportFallbackPanel';
 import { buildZip, zipEntry, type ZipEntry } from './lib/zipBundle';
 
 // ---------------------------------------------------------------- types
@@ -148,6 +150,8 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
   // item id -> why the automatic download failed. Non-empty = that window is
   // handed over as a MANUAL cut (labeled jump link to the source second).
   const [manual, setManual] = useState<Record<string, string>>({});
+  // Window whose automatic export YouTube refused → the choice panel is open.
+  const [fallback, setFallback] = useState<ExportFallbackTarget | null>(null);
 
   const toast = useCallback((msg: string | null, ms = 3500) => {
     onToast(msg);
@@ -270,15 +274,29 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       return next;
     });
 
-  const downloadItem = async (item: PlanItem, quiet = false) => {
+  const downloadItem = async (item: PlanItem) => {
     const key = item.id;
     if (exportingKey) return;
     setExportingKey(key);
     try {
-      const blob = await fetchRawClip(item.video_id, item.start, item.end, item.source_label);
-      saveBlob(blob, `heatcut_${safeFilename(item.source_label)}_${Math.floor(item.start)}-${Math.floor(item.end)}s.mp4`);
+      // mode 'auto' = cheapest partial route on the backend; when YouTube
+      // refuses BOTH partial routes the answer is a 409 and we show the user
+      // their choice instead of failing the row outright.
+      const result = await requestRawClip(item.video_id, item.start, item.end, item.source_label, { mode: 'auto' });
+      if (result.kind === 'denied') {
+        clearManual(key);
+        setFallback({
+          videoId: item.video_id,
+          startTime: item.start,
+          endTime: item.end,
+          title: item.source_label,
+          denied: result.denied,
+        });
+        return;
+      }
+      saveBlob(result.blob, `heatcut_${safeFilename(item.source_label)}_${Math.floor(item.start)}-${Math.floor(item.end)}s.mp4`);
       clearManual(key);
-      if (!quiet) toast(null);
+      toast(null);
     } catch (err) {
       // Not a dead end: the window stays in the pack as a MANUAL cut with a
       // labeled jump link to the exact second.
@@ -894,6 +912,15 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
             </div>
           ))}
         </section>
+      )}
+
+      {fallback && (
+        <ExportFallbackPanel
+          key={`${fallback.videoId}-${fallback.startTime}-${fallback.endTime}`}
+          target={fallback}
+          onClose={() => setFallback(null)}
+          onClip={(blob, filename) => saveBlob(blob, filename)}
+        />
       )}
     </div>
   );

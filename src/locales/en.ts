@@ -298,6 +298,23 @@ export const en = {
     zipEmpty: "Nothing to zip — every window was blocked (see the manual cut list).",
     zipTooBig: "Pack too big for a single archive (>1.5 GB) — download the clips individually.",
     bulkHint: "“Download all” fires one download per clip: your browser may ask ONCE to allow multiple downloads (allow it, or use “Zip all” for a single file).",
+  },
+  exportFallback: {
+    title: "This clip can't be cut automatically",
+    reasonPartialBlocked:
+      "YouTube refused our request to fetch only part of this video. Some videos only allow a full fetch — the clip can still be produced, it just has to come from the whole video.",
+    reasonBotCheck:
+      "YouTube is asking our server for a human check on this video right now. Taking the whole video often still works.",
+    reasonUnknown: "The partial fetch was refused for this video.",
+    downloadSource: "Download source directly",
+    processFull: (secs: number) => `⚙ Process full video — ~${secs}s`,
+    processingIn: (secs: number) => `Processing the whole video… about ${secs}s left. You can leave this tab open.`,
+    processingInShort: (secs: number) => `⚙ Processing… ~${secs}s`,
+    finishing: "Almost done — stitching your clip…",
+    cancel: "Cancel",
+    close: "Not now",
+    failed: (msg: string) => `Failed: ${msg}`,
+    failedFallback: "The full-video route was refused too.",
   }
 };
 

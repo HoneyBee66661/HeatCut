@@ -3,6 +3,9 @@ import { HeatmapTimeline } from './components/HeatmapTimeline';
 import { LanguageSwitcher } from './components/LanguageSwitcher';
 import CampaignPage from './CampaignPage';
 import { useLanguage } from './locales';
+import { requestRawClip, saveBlob } from './lib/rawExport';
+import { ExportFallbackPanel } from './components/ExportFallbackPanel';
+import type { ExportFallbackTarget } from './components/ExportFallbackPanel';
 import type { AnalyzeResponse, ViralClip } from './types';
 
 // Declare YT global variables for TypeScript
@@ -230,6 +233,9 @@ export default function App() {
   const clipEndIntervalRef = useRef<number | null>(null);
   const loadingSectionRef = useRef<HTMLElement | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  // Clip whose automatic export YouTube refused → the choice panel is open
+  // (whole video with a countdown, or download the source directly).
+  const [exportFallback, setExportFallback] = useState<ExportFallbackTarget | null>(null);
   const [copyTimestampMenuTarget, setCopyTimestampMenuTarget] = useState<'toolbar' | 'overview' | null>(null);
 
   // Close timestamp format menu on click outside or escape
@@ -1099,59 +1105,26 @@ Transcript:
         .slice(0, 80) || 'clip';
     const filename = `heatcut_${safeTitle}.mp4`;
     try {
-      // Prefer the DEVICE WORKER for downloads: on cloud deploys (Vercel)
-      // the server cannot scrape YouTube (datacenter IPs are bot-blocked),
-      // but a worker running on this same device (http://127.0.0.1:8765,
-      // loopback is exempt from mixed-content) downloads over the user's
-      // residential connection and streams the file straight to this tab.
-      let workerOnline = false;
-      try {
-        const probe = await fetch(`${HEATMAP_WORKER_URL}/health`, { signal: AbortSignal.timeout(WORKER_PROBE_TIMEOUT_MS) });
-        workerOnline = probe.ok;
-      } catch {
-        workerOnline = false;
-      }
-
-      let blob: Blob;
-      if (workerOnline) {
-        const qs = new URLSearchParams({
-          video_id: result.video_id,
-          start_time: String(clip.start_time),
-          end_time: String(clip.end_time),
-          title: result.title,
-        }).toString();
-        const resp = await fetch(`${HEATMAP_WORKER_URL}/export?${qs}`, { headers: workerHeaders() });
-        if (!resp.ok) {
-          const detail = await resp.json().catch(() => null);
-          throw new Error(detail?.detail || t.results.exportFailed);
-        }
-        blob = await resp.blob();
-      } else {
-        const resp = await fetch('/api/export', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            video_id: result.video_id,
-            start_time: clip.start_time,
-            end_time: clip.end_time,
-            title: result.title,
-          }),
+      // Prefer the DEVICE WORKER for downloads (loopback is exempt from
+      // mixed-content); the server route is the fallback. mode 'auto' lets the
+      // backend take the cheapest partial route, and a refusal comes back as a
+      // 409 so we can offer the user their two options instead of a dead end.
+      const sourceId = result.video_id;
+      const sourceTitle = result.title || `video-${result.video_id}`;
+      const clipResult = await requestRawClip(
+        sourceId, clip.start_time, clip.end_time, sourceTitle, { mode: 'auto' },
+      );
+      if (clipResult.kind === 'denied') {
+        setExportFallback({
+          videoId: sourceId,
+          startTime: clip.start_time,
+          endTime: clip.end_time,
+          title: sourceTitle,
+          denied: clipResult.denied,
         });
-        if (!resp.ok) {
-          const detail = await resp.json().catch(() => null);
-          throw new Error(detail?.detail || t.results.exportFailed);
-        }
-        blob = await resp.blob();
+        return;
       }
-
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      saveBlob(clipResult.blob, filename);
       setToastMessage(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1412,6 +1385,17 @@ Transcript:
 
   return (
     <div className="app-container">
+      {/* YouTube refused the partial fetch: let the user pick (whole video with
+          an ETA, or grab the source themselves). */}
+      {exportFallback && (
+        <ExportFallbackPanel
+          key={`${exportFallback.videoId}-${exportFallback.startTime}-${exportFallback.endTime}`}
+          target={exportFallback}
+          onClose={() => setExportFallback(null)}
+          onClip={(blob, filename) => saveBlob(blob, filename)}
+        />
+      )}
+
       {/* Toast Notification */}
       {toastMessage && (
         <div className="toast-msg">
