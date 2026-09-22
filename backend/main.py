@@ -36,6 +36,7 @@ from typing import List, Optional, Any, Tuple
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 # NOTE: yt_dlp & youtube_transcript_api are intentionally NOT imported here.
 # They are heavy packages needed only for local/direct scraping; on serverless
@@ -2434,6 +2435,8 @@ def health_check():
         "asr_enabled": _asr_enabled(),
         "asr_model": (os.environ.get("HEATCUT_WHISPER_MODEL") or "small"),
         "asr_engine": "faster-whisper (local, cpu int8)",
+        # video downloader (YouTube/TikTok/Instagram → file)
+        "downloader_enabled": True,
     }
 
 
@@ -4242,4 +4245,514 @@ async def transcript_window(request: TranscriptWindowRequest, http_request: Requ
                 video_id, request.start, request.end, result.get("source"),
                 len(result.get("lines") or []), float(result.get("elapsed") or 0.0))
     return result
+
+
+# ----------------------------------------------------------------
+# Video downloader: YouTube / TikTok / Instagram → one file
+# ----------------------------------------------------------------
+# Two thin routes over the studio's EXISTING media plumbing — nothing here
+# re-implements a download:
+#   * timestamp windows reuse the export ladder (`_auto_partial_export` for
+#     YouTube: DASH fragment ranges → HLS segments; the same two miners in a
+#     different order for the other platforms, whose media is usually HLS or a
+#     single progressive mp4);
+#   * audio-only windows reuse the ASR path's audio DASH fragment ranges
+#     (`_asr_pick_audio_format` + `_download_fmp4_window`), ~0.8 MB per 30 s;
+#   * whole-file downloads are yt-dlp with the same client ladder + cookie jar
+#     the export uses (a media 403 is recovered per client, not by trusting
+#     extraction).
+# Pure decision logic (platform, timestamps, format menus, filenames) lives in
+# `backend/downloader.py` and is mirrored by the device worker.
+try:  # uvicorn backend.main:app (repo root on sys.path) vs Vercel (backend/ on path)
+    from backend import downloader as dl_mod
+except ImportError:  # pragma: no cover
+    import downloader as dl_mod  # type: ignore
+
+DOWNLOADER_RATE_LIMIT = int(os.environ.get("HEATCUT_DOWNLOADER_RATE_LIMIT", "40"))  # per IP per hour
+DOWNLOADER_RATE_WINDOW = 3600.0
+# One request = one window; the UI loops for multiple parts (and zips them).
+DOWNLOADER_MAX_WINDOW = float(os.environ.get("HEATCUT_DOWNLOADER_MAX_WINDOW", "3600"))
+
+
+class DownloaderProbeRequest(BaseModel):
+    url: str = Field(..., description="Any yt-dlp link: YouTube, TikTok, Instagram, ...")
+
+
+class DownloaderParseRequest(BaseModel):
+    parts: str = Field(..., description="Timestamp text, e.g. '1:20-2:05, 3:00-3:40'")
+    duration: float = Field(default=0.0, ge=0)
+
+
+class DownloaderFetchRequest(BaseModel):
+    url: str
+    kind: str = Field(default="video", description="'video' | 'audio'")
+    mode: str = Field(default="full", description="'full' = the whole media, 'window' = start/end only")
+    start_time: float = Field(default=0.0, ge=0)
+    end_time: float = Field(default=0.0, ge=0)
+    quality: Optional[str] = Field(default=None, description="'best' | '1080' | '720' | ... (video only)")
+    audio_format: str = Field(default="m4a", description="'m4a' = keep the original AAC (stream copy), 'mp3' = re-encode")
+    title: Optional[str] = Field(default=None, description="Known video title, used for the filename")
+    fallback: bool = Field(default=False,
+                           description="The user chose the whole-file route after a refused partial fetch")
+
+
+def _dl_window_label(start: float, end: float) -> str:
+    """'1m20s-2m05s' — a filesystem-safe window label for the filename."""
+    def one(sec: float) -> str:
+        sec = max(0.0, float(sec or 0))
+        m, s = divmod(int(sec), 60)
+        return f"{m}m{s:02d}s"
+
+    return f"{one(start)}-{one(end)}"
+
+
+def _dl_extract(url: str, probe_only: bool = False):
+    """(info, client, plan, platform) for any supported link.
+
+    YouTube goes through `_extract_info_for_export` (the servable-client ladder):
+    the probe is the only caller that can skip it, because a probe does not
+    fetch media and does not want to spend 10 URL probes on a status card.
+    """
+    import yt_dlp
+
+    platform = dl_mod.classify_url(url)
+    if platform["platform"] == "youtube" and not probe_only:
+        info, client, plan = _extract_info_for_export(url)
+        return info, client, plan, platform
+
+    opts: Any = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "socket_timeout": 15, "retries": 2, "skip_download": True,
+        **_yt_env_opts(),
+    }
+    cf = get_yt_cookiefile()
+    if cf:
+        opts["cookiefile"] = cf
+    proxy = get_proxy_url()
+    if proxy:
+        opts["proxy"] = proxy
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise ValueError("this link returned no video")
+    entries = [e for e in (info.get("entries") or []) if e]
+    if entries:  # playlists / carousels: the first item is the video
+        info = entries[0]
+    return info, None, None, platform
+
+
+def _dl_download(url: str, tmpdir: str, fmt: str, client: Any = None, plan: Any = None,
+                 is_youtube: bool = False, pin_plan: bool = True) -> str:
+    """Whole-file yt-dlp download (stream-copied by yt-dlp's own merge).
+
+    Only YouTube marches down the player-client ladder: for other sites a
+    refused media URL is usually a login/cookie problem (`extractor_args` for
+    youtube is meaningless there). `pin_plan=False` keeps the caller's format
+    string even when the probe has a servable pair — REQUIRED for audio-only
+    downloads, whose `bestaudio` selector must not be replaced by the video
+    pair (measured: the pin turned an audio request into an 84 MB video file).
+    """
+    import yt_dlp
+
+    base: Any = {
+        "format": fmt,
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(tmpdir, "dl_src.%(ext)s"),
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "socket_timeout": 20, "retries": 3,
+        **_yt_env_opts(),
+    }
+    cf = get_yt_cookiefile()
+    if cf:
+        base["cookiefile"] = cf
+    proxy = get_proxy_url()
+    if proxy:
+        base["proxy"] = proxy
+
+    attempts: List[Any] = []
+    if is_youtube:
+        if pin_plan and plan and plan.get("format"):
+            base["format"] = str(plan["format"])      # the pair the probe proved servable
+        if client:
+            attempts.append(client)
+        for c in _yt_export_clients():
+            if c not in attempts:
+                attempts.append(c)
+    if not attempts:
+        attempts = [None]
+
+    last_err: Any = None
+    for idx, name in enumerate(attempts):
+        attempt: Any = dict(base)
+        if idx:
+            attempt["format"] = fmt       # a pinned format_id belongs to ONE client
+        if is_youtube and name and name != "default":
+            attempt["extractor_args"] = {"youtube": {"player_client": [name]}}
+        try:
+            with yt_dlp.YoutubeDL(attempt) as ydl:
+                ydl.download([url])
+            last_err = None
+            break
+        except Exception as e:  # noqa: BLE001 — try the next client
+            last_err = e
+            logger.warning(f"[download] yt-dlp via client={name or 'default'} failed ({str(e)[:130]})")
+            _clear_export_artifacts(tmpdir)
+    if last_err is not None:
+        raise last_err
+
+    for f in sorted(os.listdir(tmpdir)):
+        if f.startswith("dl_src.") and not f.endswith((".part", ".ytdl")):
+            return os.path.join(tmpdir, f)
+    raise ValueError("the download produced no file")
+
+
+def _dl_cut(src: str, out: str, start: float, end: float, audio_only: bool = False,
+            audio_ext: str = "m4a") -> bool:
+    """Frame-aligned-by-keyframe stream-copy cut; re-encode only as a fallback.
+
+    `src` is a normally downloaded file here (never a fragment-range slice), so
+    the input-side `-ss` is safe — the fragment-slice trap lives in
+    `_ffmpeg_extract_wav` and `_dl_audio_window`.
+    """
+    span = max(0.1, end - start)
+    head = ["-ss", f"{start:.3f}", "-i", src, "-t", f"{span:.3f}"]
+    if audio_only:
+        reencode = ["-c:a", "libmp3lame", "-q:a", "2"] if audio_ext == "mp3" \
+            else ["-c:a", "aac", "-b:a", "192k"]
+        if audio_ext != "mp3" and _ffmpeg_run([*head, "-vn", "-c:a", "copy",
+                                               "-avoid_negative_ts", "make_zero", out]):
+            return True
+        return _ffmpeg_run([*head, "-vn", *reencode, "-avoid_negative_ts", "make_zero", out])
+    if _ffmpeg_run([*head, "-c", "copy", "-avoid_negative_ts", "make_zero", "-map", "0", out]):
+        return True
+    return _ffmpeg_run([*head, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                        "-c:a", "aac", "-b:a", "128k", "-map", "0", out])
+
+
+def _dl_partial_window(url: str, tmpdir: str, start: float, end: float, info: Any = None,
+                       is_youtube: bool = False) -> str:
+    """The window cut of a NON-YouTube link: HLS segments, then the DASH miner.
+
+    YouTube keeps its own proven ladder (`_auto_partial_export` = DASH ranges
+    first). TikTok/Instagram hand back muxed HLS or a progressive mp4, so the
+    segment miner is the cheap path there. Raises `PartialBlocked` when neither
+    works, so the caller can offer the whole-file route.
+    """
+    span = end - start
+    errors: List[str] = []
+    formats = (info or {}).get("formats") or []
+
+    hls_fmt = _hls_pick_format(formats)
+    if hls_fmt:
+        try:
+            out = _hls_segment_export(hls_fmt, tmpdir, start, end)
+            if _probe_duration(out) >= span * 0.9:
+                return out
+            raise ValueError(f"HLS output too short ({_probe_duration(out):.1f}s vs {span:.1f}s)")
+        except Exception as e:  # noqa: BLE001 — fall through to the miner
+            errors.append(f"hls-segments: {str(e)[:110]}")
+            _clear_export_artifacts(tmpdir)
+    else:
+        errors.append("hls-segments: no muxed HLS rendition")
+
+    try:
+        out = _frag_miner_export(url, tmpdir, start, end, info=info)
+        if _probe_duration(out) >= span * 0.9:
+            return out
+        raise ValueError("miner output too short")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"dash-range: {str(e)[:110]}")
+        _clear_export_artifacts(tmpdir)
+
+    joined = " | ".join(errors)
+    raise PartialBlocked("yt_bot_check" if _looks_like_botcheck(joined) else "partial_blocked", joined)
+
+
+def _dl_audio_window(url: str, tmpdir: str, start: float, end: float, info: Any = None,
+                     audio_ext: str = "m4a", is_youtube: bool = False) -> str:
+    """Audio-ONLY window, cheapest path first.
+
+    1. audio-only DASH fragment range (the ASR ladder's format — ~0.8 MB per
+       30 s window instead of ~12 MB of muxed HLS);
+    2. the window's video clip with its video track dropped (`-vn -c:a copy`).
+    The returned file starts exactly at `start`.
+    """
+    span = max(0.5, end - start)
+    out = os.path.join(tmpdir, f"dl_audio.{ 'mp3' if audio_ext == 'mp3' else 'm4a'}")
+    problems: List[str] = []
+
+    fmt = _asr_pick_audio_format(info)
+    if fmt is not None:
+        try:
+            data, _begin, _end = _download_fmp4_window(fmt, start, end)
+            src = os.path.join(tmpdir, "dl_audio_slice.m4a")
+            with open(src, "wb") as fh:
+                fh.write(data)
+            # Fragment slices carry ABSOLUTE PTS and the sidx time base can
+            # disagree with them → trust the packets (see `_ffmpeg_extract_wav`):
+            # the slice must COVER the window, and the offset comes from its
+            # real first PTS. Output-side `-ss` only — never an input-side seek
+            # on a fragment slice (it decodes to garbage).
+            first, last = _stream_pts_span(src, 1)
+            if first is None or last is None:
+                problems.append("dash-audio: slice has no packet times")
+            elif last < end - 1.0 or first > start + 1.0:
+                problems.append(f"dash-audio: slice covers {first:.1f}-{last:.1f}s "
+                                f"for window {start:.1f}-{end:.1f}s")
+            else:
+                lead = max(0.0, start - first)
+                if audio_ext == "mp3":
+                    ok = _ffmpeg_run(["-i", src, "-ss", f"{lead:.3f}", "-t", f"{span:.3f}", "-vn",
+                                      "-c:a", "libmp3lame", "-q:a", "2", out])
+                else:
+                    ok = _ffmpeg_run(["-i", src, "-ss", f"{lead:.3f}", "-t", f"{span:.3f}", "-vn",
+                                      "-c:a", "copy", "-avoid_negative_ts", "make_zero", out])
+                if ok and _probe_duration(out) >= span * 0.85:
+                    logger.info(f"[download] audio window via DASH range ({len(data) // 1024} KB, "
+                                f"slice {first:.1f}-{last:.1f}s, lead {lead:.2f}s)")
+                    return out
+                problems.append("dash-audio: cut failed or came out short")
+        except Exception as e:  # noqa: BLE001 — refused range / no sidx / extraction
+            problems.append(f"dash-audio: {str(e)[:110]}")
+        _clear_export_artifacts(tmpdir)
+    else:
+        problems.append("dash-audio: no audio-only stream")
+
+    # 2) the window's video clip, audio track kept / video dropped
+    try:
+        clip = (_auto_partial_export(url, tmpdir, start, end, info=info) if is_youtube
+                else _dl_partial_window(url, tmpdir, start, end, info=info, is_youtube=False))
+        if _dl_cut(clip, out, 0.0, _probe_duration(clip) or span, audio_only=True, audio_ext=audio_ext):
+            logger.info(f"[download] audio window from the clip ladder ({os.path.basename(clip)})")
+            return out
+        problems.append("clip ladder: produced no decodable audio")
+    except Exception as e:  # noqa: BLE001 — PartialBlocked / ffmpeg
+        problems.append(f"clip ladder refused ({str(e)[:110]})")
+
+    raise PartialBlocked("partial_blocked", " | ".join(problems))
+
+
+def _dl_full_audio(url: str, tmpdir: str, audio_ext: str, client: Any = None,
+                   is_youtube: bool = False) -> str:
+    """Whole audio stream: `bestaudio` m4a when possible, mp3 on request.
+
+    The file ALWAYS goes through ffmpeg with `-vn`, so an extractor that hands
+    back a muxed file can never make "audio only" return a video (and the
+    download deliberately does NOT reuse the probe's video+audio pair).
+    """
+    src = _dl_download(url, tmpdir, "bestaudio[ext=m4a]/bestaudio/best", client=client,
+                       is_youtube=is_youtube, pin_plan=False)
+    if audio_ext == "mp3":
+        out = os.path.join(tmpdir, "dl_full.mp3")
+        if not _ffmpeg_run(["-i", src, "-vn", "-c:a", "libmp3lame", "-q:a", "2", out]):
+            raise ValueError("ffmpeg could not produce the mp3")
+        return out
+    out = os.path.join(tmpdir, "dl_full.m4a")
+    if _ffmpeg_run(["-i", src, "-vn", "-c:a", "copy", "-movflags", "+faststart", out]) \
+            and os.path.exists(out) and os.path.getsize(out) > 1000:
+        return out
+    # webm/opus → m4a: the copy above cannot carry opus into mp4, so re-encode.
+    if not _ffmpeg_run(["-i", src, "-vn", "-c:a", "aac", "-b:a", "192k", out]):
+        raise ValueError("ffmpeg could not produce the m4a")
+    return out
+
+
+def _dl_fetch_path(request: "DownloaderFetchRequest") -> tuple:
+    """Produce the requested file → (path, tmpdir, kind, ext). Raises on refusal.
+
+    Three shapes of request, one file each:
+      * `mode="full"`                      → the whole media, untouched;
+      * `mode="window"`                    → the cheap partial miner path (409
+                                             when the host refuses both);
+      * `mode="window"` + `fallback=True`  → the user's explicit choice after a
+                                             409: download the whole media and
+                                             cut the window locally (heavy, but
+                                             honest — never automatic).
+    """
+    kind = "audio" if (request.kind or "").strip().lower() == "audio" else "video"
+    window_requested = (request.mode or "").strip().lower() == "window"
+    use_partial = window_requested and not request.fallback
+    audio_ext = "mp3" if (request.audio_format or "").strip().lower() == "mp3" else "m4a"
+
+    info, client, plan, platform = _dl_extract(request.url)
+    is_yt = platform["platform"] == "youtube"
+    dur = float((info or {}).get("duration") or 0)
+    start, end = float(request.start_time), float(request.end_time)
+    if window_requested:
+        if end <= start:
+            raise HTTPException(status_code=400, detail="end_time must be greater than start_time.")
+        if end - start > DOWNLOADER_MAX_WINDOW:
+            raise HTTPException(status_code=400,
+                                detail=f"Window too long ({end - start:.0f}s) — "
+                                       f"max {int(DOWNLOADER_MAX_WINDOW)}s.")
+        if dur and start >= dur:
+            raise HTTPException(status_code=400,
+                                detail=f"That window starts past the end of the video ({dur:.0f}s).")
+
+    tmpdir = _new_export_tmp_dir_or_500()
+    try:
+        # ── cheap partial routes (the miners transfer only the window) ──────
+        if use_partial:
+            if kind == "audio":
+                path = _dl_audio_window(request.url, tmpdir, start, end, info=info,
+                                        audio_ext=audio_ext, is_youtube=is_yt)
+                return path, tmpdir, "audio", audio_ext
+            path = (_auto_partial_export(request.url, tmpdir, start, end, info=info) if is_yt
+                    else _dl_partial_window(request.url, tmpdir, start, end, info=info, is_youtube=False))
+            return path, tmpdir, "video", "mp4"
+
+        # ── whole-media route (mode=full, or the window fallback) ───────────
+        if kind == "audio":
+            whole = _dl_full_audio(request.url, tmpdir, audio_ext, client=client, is_youtube=is_yt)
+            if not window_requested:
+                return whole, tmpdir, "audio", audio_ext
+            out = os.path.join(tmpdir, f"dl_window.{audio_ext}")
+            if not _dl_cut(whole, out, start, end, audio_only=True, audio_ext=audio_ext):
+                raise ValueError("could not cut the window out of the whole audio")
+            return out, tmpdir, "audio", audio_ext
+
+        height = 0
+        try:
+            height = int(str(request.quality or "").strip().rstrip("p") or 0)
+        except ValueError:
+            height = 0
+        fmt = (f"bv*[height<={height}]+ba/b[height<={height}]/b" if is_yt else f"b[height<={height}]/b") \
+            if height else ("bv*[height<=1080]+ba/b[height<=1080]/b" if is_yt else "b")
+        src = _dl_download(request.url, tmpdir, fmt, client=client, plan=plan, is_youtube=is_yt)
+        if window_requested:
+            out = os.path.join(tmpdir, "dl_window.mp4")
+            if not _dl_cut(src, out, start, end):
+                raise ValueError("could not cut the window out of the whole video")
+            return out, tmpdir, "video", "mp4"
+        if os.path.splitext(src)[1].lower() == ".mp4":
+            return src, tmpdir, "video", "mp4"
+        out = os.path.join(tmpdir, "dl_full.mp4")
+        if not _ffmpeg_run(["-i", src, "-c", "copy", "-movflags", "+faststart", out]):
+            if not _ffmpeg_run(["-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                                "-c:a", "aac", "-b:a", "128k", out]):
+                raise ValueError("ffmpeg could not produce the mp4")
+        return out, tmpdir, "video", "mp4"
+    except BaseException:
+        _finish_export_job(tmpdir)
+        raise
+
+
+@app.post("/api/downloader/probe")
+async def downloader_probe(request: DownloaderProbeRequest, http_request: Request):
+    """Describe a pasted link: platform, title, duration, quality/audio menus.
+
+    No media is fetched, so this is cheap — and it is where a link that needs a
+    login (private Instagram, age-gated YouTube) fails early with a plain
+    message instead of after a download attempt.
+    """
+    url = (request.url or "").strip()
+    if not dl_mod.is_supported_url(url):
+        raise HTTPException(status_code=400, detail="Paste a full http(s) link.")
+    if _rate_limited(f"dlprobe:{_client_ip(http_request)}", DOWNLOADER_RATE_LIMIT, DOWNLOADER_RATE_WINDOW):
+        raise HTTPException(status_code=429,
+                            detail=f"Too many downloader requests from this address "
+                                   f"(max {DOWNLOADER_RATE_LIMIT}/hour).")
+    platform = dl_mod.classify_url(url)
+    try:
+        info, _client, _plan, _platform = await asyncio.to_thread(_dl_extract, url, True)
+    except Exception as e:  # noqa: BLE001 — surface a clean, actionable error
+        msg = str(e)
+        try:  # yt-dlp may be absent on a slim/cloud deploy — never mask the error
+            from yt_dlp.utils import DownloadError as _DE  # type: ignore
+            if isinstance(e, _DE) and getattr(e, "exc_info", None):
+                msg = str(e.exc_info[1] or e)
+        except Exception:  # noqa: BLE001
+            pass
+        friendly = _botcheck_message(e) or dl_mod.friendly_error(msg, platform["platform"])
+        raise HTTPException(status_code=502, detail={
+            "message": f"Could not read this {platform['label']} link: {friendly}",
+            "platform": platform["platform"],
+            "note": platform["note"],
+        }) from e
+    payload = dl_mod.probe_payload(dict(info or {}), url)
+    logger.info("[download] probe %s → %s (%s, %s)",
+                url[:80], payload["platform"], payload["title"][:60], payload["duration_label"] or "?")
+    return payload
+
+
+@app.post("/api/downloader/parse")
+async def downloader_parse(request: DownloaderParseRequest):
+    """Validate a pasted timestamp list → ordered windows (single source of truth).
+
+    The UI previews windows with this instead of re-implementing the parser in
+    TypeScript, so what the page shows is exactly what the route will cut.
+    """
+    try:
+        windows = dl_mod.parse_windows(request.parts, request.duration)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    total = sum(w["end"] - w["start"] for w in windows)
+    return {
+        "windows": windows,
+        "count": len(windows),
+        "total_seconds": round(total, 3),
+        "total_label": dl_mod.format_clock(total),
+    }
+
+
+@app.post("/api/downloader/fetch")
+async def downloader_fetch(request: DownloaderFetchRequest, http_request: Request):
+    """Download ONE file: the whole media, or the exact requested window.
+
+    `mode="window"` is the cheap path (the miners transfer only the window);
+    when both partial routes are refused the answer is HTTP 409 with the same
+    shape the studio's export uses, and the UI offers the whole-file route
+    (`fallback: true`) instead of downloading hundreds of MB unannounced.
+    """
+    url = (request.url or "").strip()
+    if not dl_mod.is_supported_url(url):
+        raise HTTPException(status_code=400, detail="Paste a full http(s) link.")
+    if _rate_limited(f"dlfetch:{_client_ip(http_request)}", DOWNLOADER_RATE_LIMIT, DOWNLOADER_RATE_WINDOW):
+        raise HTTPException(status_code=429,
+                            detail=f"Too many downloader requests from this address "
+                                   f"(max {DOWNLOADER_RATE_LIMIT}/hour).")
+
+    try:
+        path, tmpdir, kind, ext = await asyncio.to_thread(_dl_fetch_path, request)
+    except PartialBlocked as pb:
+        platform = dl_mod.classify_url(url)
+        raise HTTPException(status_code=409, detail={
+            "code": pb.code,
+            "est_seconds": 90,
+            "source_url": url,
+            "platform": platform["platform"],
+            "message": (f"{platform['label']} refused our request to fetch only part of this media — "
+                        "the window can still be produced from the whole file."),
+            "reason": pb.detail[:300],
+        }) from pb
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 — surface a clean API error to the client
+        friendly = _botcheck_message(e) or dl_mod.friendly_error(
+            str(e), dl_mod.classify_url(url)["platform"])
+        raise HTTPException(status_code=502, detail=f"Download failed: {friendly}") from e
+
+    try:
+        title = (request.title or "").strip() or (os.path.basename(path) if path else "download")
+        window_label = ""
+        if (request.mode or "").strip().lower() == "window":
+            # A window is a window whether it came from the miner or from the
+            # whole-file fallback — the filename must say which seconds it is.
+            window_label = _dl_window_label(request.start_time, request.end_time)
+        filename = dl_mod.filename_for(title, kind, ext, window_label)
+        media_type = {"mp4": "video/mp4", "m4a": "audio/mp4", "mp3": "audio/mpeg"}.get(ext, "application/octet-stream")
+        logger.info("[download] %s → %s (%s)", url[:80], filename,
+                    f"{os.path.getsize(path) / 1e6:.1f} MB" if os.path.exists(path) else "?")
+    except BaseException:
+        # Anything failing between "we have the file" and the response would
+        # otherwise leak a live job dir (its heartbeat names this pid, so the
+        # TTL cleaner deliberately skips it until the process restarts).
+        _finish_export_job(tmpdir)
+        raise
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=filename,
+        background=BackgroundTask(_finish_export_job, tmpdir),
+    )
 
