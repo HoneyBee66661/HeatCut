@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { HeatmapTimeline } from './components/HeatmapTimeline';
 import { LanguageSwitcher } from './components/LanguageSwitcher';
 import CampaignPage from './CampaignPage';
+import VideoDownloaderPage from './VideoDownloaderPage';
+import AppDrawer, { type AppView } from './components/AppDrawer';
 import { useLanguage } from './locales';
 import { requestRawClip, saveBlob } from './lib/rawExport';
 import { ExportFallbackPanel } from './components/ExportFallbackPanel';
@@ -75,9 +77,11 @@ const MODEL_PRESETS: Record<string, string[]> = {
 
 export default function App() {
   const { t } = useLanguage();
-  // Two screens in one app: the YouTube hotspot studio, and the campaign-prep
-  // page (paste a clipping-campaign link -> raw material for post-production).
-  const [view, setView] = useState<'studio' | 'campaign'>('studio');
+  // Three screens in one app, reachable from the hamburger drawer: the YouTube
+  // hotspot studio, the campaign-prep page (paste a clipping-campaign link ->
+  // raw material for post-production) and the standalone video downloader.
+  const [view, setView] = useState<AppView>('studio');
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [url, setUrl] = useState('');
   const [durationPref, setDurationPref] = useState<'15s' | '30s' | '60s'>('30s');
   const [sourceMode, setSourceMode] = useState<'auto' | 'podcast' | 'concert'>('auto');
@@ -1470,25 +1474,31 @@ Transcript:
           </div>
         </div>
         <div className="header-nav" style={{ display: 'flex', alignItems: 'center', gap: '0.85rem' }}>
-          <LanguageSwitcher />
           <button
             type="button"
             className="glowing-btn"
-            onClick={() => setView(prev => (prev === 'campaign' ? 'studio' : 'campaign'))}
-            title={view === 'campaign' ? t.header.backToStudio : t.campaign.subtitle}
+            data-testid="drawer-toggle"
+            onClick={() => setDrawerOpen(true)}
+            aria-label={t.header.menu}
+            title={t.header.menu}
             style={{
-              padding: '0.5rem 1rem',
-              fontSize: '0.8rem',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.45rem',
+              padding: '0.5rem 0.85rem',
+              fontSize: '0.85rem',
               borderRadius: '8px',
-              border: '1px solid rgba(255, 94, 58, 0.45)',
-              background: view === 'campaign' ? 'rgba(255, 94, 58, 0.16)' : 'rgba(255, 255, 255, 0.04)',
+              border: '1px solid var(--border-color)',
+              background: 'rgba(255, 255, 255, 0.04)',
               color: 'var(--text-primary)',
               cursor: 'pointer',
               boxShadow: 'none',
             }}
           >
-            {view === 'campaign' ? `↩ ${t.header.backToStudio}` : `🎯 ${t.header.campaignNav}`}
+            <span aria-hidden="true" style={{ fontSize: '1rem', lineHeight: 1 }}>☰</span>
+            {t.header.menu}
           </button>
+          <LanguageSwitcher />
           <a
             href="https://tako.id/johansa"
             target="_blank"
@@ -1508,6 +1518,13 @@ Transcript:
         </div>
       </header>
 
+      <AppDrawer
+        open={drawerOpen}
+        view={view}
+        onSelect={setView}
+        onClose={() => setDrawerOpen(false)}
+      />
+
       {view === 'campaign' ? (
         <CampaignPage
           apiKey={apiKey}
@@ -1516,6 +1533,8 @@ Transcript:
           baseUrl={aiBaseUrl}
           onToast={setToastMessage}
         />
+      ) : view === 'downloader' ? (
+        <VideoDownloaderPage onToast={setToastMessage} />
       ) : (
       <>
       {/* Main Form controls panel */}

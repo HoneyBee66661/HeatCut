@@ -1085,3 +1085,22 @@ label[for="manual-subtitle-file"]:hover {
   }
 }
 
+/* Navigation drawer (hamburger menu) */
+@keyframes hc-drawer-in {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+@keyframes hc-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
