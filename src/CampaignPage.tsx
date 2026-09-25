@@ -3,6 +3,8 @@ import { useLanguage } from './locales';
 import { fetchRawClip, requestRawClip, safeFilename, saveBlob, youtubeLink } from './lib/rawExport';
 import { ExportFallbackPanel } from './components/ExportFallbackPanel';
 import type { ExportFallbackTarget } from './components/ExportFallbackPanel';
+import MaterialFinder from './components/MaterialFinder';
+import type { MaterialPersist } from './components/MaterialFinder';
 import { buildZip, zipEntry, type ZipEntry } from './lib/zipBundle';
 import { fetchWindowTranscript, srtFilename, type WindowTranscript } from './lib/transcript';
 import {
@@ -168,6 +170,8 @@ interface CampaignPageProps {
   model: string;
   baseUrl: string;
   onToast: (message: string | null) => void;
+  /** Jump back to the Studio with a URL pre-filled (material → analyze hand-off). */
+  onSendToStudio?: (url: string) => void;
 }
 
 /** One archive is one download — cap it so the tab never has to hold a huge pack. */
@@ -186,7 +190,7 @@ const fmt = (sec: number): string => {
   return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 };
 
-export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast }: CampaignPageProps) {
+export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast, onSendToStudio }: CampaignPageProps) {
   const { t, language } = useLanguage();
   const c = t.campaign;
 
@@ -226,6 +230,12 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
   const [strategy, setStrategy] = useState<CreativeStrategy | null>(null);
   const [strategyMd, setStrategyMd] = useState('');
   const [strategyBusy, setStrategyBusy] = useState(false);
+  // Simple vs advanced in the consultant: the average user gets the guided
+  // material finder; the marketing board (KPI/A-B/cadence) hides behind a toggle.
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [materialState, setMaterialState] = useState<MaterialPersist | null>(null);
+  /** Bumped when a saved session is loaded so the finder remounts with its data. */
+  const [materialKey, setMaterialKey] = useState(0);
   const [exportingKey, setExportingKey] = useState<string | null>(null);
   const [bulk, setBulk] = useState<{ done: number; total: number } | null>(null);
   const [bulkZip, setBulkZip] = useState(false);
@@ -462,9 +472,16 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       strategy, strategy_md: strategyMd,
       strategy_prompt: strategyPrompt, strategy_tone: strategyTone,
       strategy_audience: strategyAudience, strategy_ideas: strategyIdeaCount,
+      material: materialState?.material || null,
+      material_md: materialState?.material_md || '',
+      material_subject: materialState?.subject || '',
+      material_artist: materialState?.artist || '',
+      material_lyrics: materialState?.lyrics || '',
+      material_vibe: materialState?.vibe || 'auto',
+      material_style: materialState?.style || 'auto',
     };
   }, [spec, plan, selected, url, targetDuration, perSource, maxTotal, aiCopy, manual, exported, transcripts,
-      strategy, strategyMd, strategyPrompt, strategyTone, strategyAudience, strategyIdeaCount]);
+      strategy, strategyMd, strategyPrompt, strategyTone, strategyAudience, strategyIdeaCount, materialState]);
 
   // Debounced auto-save: a new plan, a finished download or a fresh caption
   // lands in localStorage within a second of the UI going idle.
@@ -504,6 +521,16 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     setStrategyTone(session.strategy_tone || 'auto');
     setStrategyAudience(session.strategy_audience || '');
     setStrategyIdeaCount(session.strategy_ideas || 10);
+    setMaterialState(session.material || session.material_md ? {
+      material: session.material || null,
+      material_md: session.material_md || '',
+      subject: session.material_subject || '',
+      artist: session.material_artist || '',
+      lyrics: session.material_lyrics || '',
+      vibe: session.material_vibe || 'auto',
+      style: session.material_style || 'auto',
+    } : null);
+    setMaterialKey(k => k + 1);
     setFallback(null);
     setError(null);
     toast(c.sessionLoaded(session.label), 6000);
@@ -719,6 +746,11 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     if (strategyMd) {
       entries.push(await zipEntry('STRATEGY.md', new Blob([strategyMd], { type: 'text/markdown' })));
     }
+    // ...and so does the material plan (beats, links, steps).
+    const materialMd = materialState?.material_md || '';
+    if (materialMd) {
+      entries.push(await zipEntry('MATERIAL.md', new Blob([materialMd], { type: 'text/markdown' })));
+    }
     saveBlob(buildZip(entries), `heatcut_campaign_${plan.campaign_id || 'pack'}_raw.zip`);
     setBulk(null);
     setBulkZip(false);
@@ -731,12 +763,16 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
    * BRIEF.md once a plan exists) — still ONE download, no permission gate.
    */
   const downloadStrategyPack = async () => {
-    if (!strategyMd || bulkZip) return;
+    if ((!strategyMd && !materialState?.material_md) || bulkZip) return;
     setBulkZip(true);
     try {
-      const entries: ZipEntry[] = [
-        await zipEntry('STRATEGY.md', new Blob([strategyMd], { type: 'text/markdown' })),
-      ];
+      const entries: ZipEntry[] = [];
+      if (strategyMd) {
+        entries.push(await zipEntry('STRATEGY.md', new Blob([strategyMd], { type: 'text/markdown' })));
+      }
+      if (materialState?.material_md) {
+        entries.push(await zipEntry('MATERIAL.md', new Blob([materialState.material_md], { type: 'text/markdown' })));
+      }
       if (plan?.brief_md) {
         entries.push(await zipEntry('BRIEF.md', new Blob([plan.brief_md], { type: 'text/markdown' })));
       }
@@ -1131,11 +1167,40 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
           itself is the data: angles, copy, marketing levers, compliance. */}
       {spec && (
         <section className="glass-panel" data-testid="strategy-card" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          <div>
-            <h3 style={{ margin: 0, fontSize: '1.05rem' }}>🧠 {c.strategyTitle}</h3>
-            <p style={{ margin: '0.25rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>{c.strategySubtitle}</p>
+          <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'flex-start', flexWrap: 'wrap' }}>
+            <div style={{ flex: '1 1 320px' }}>
+              <h3 style={{ margin: 0, fontSize: '1.05rem' }}>🧠 {c.strategyTitle}</h3>
+              <p style={{ margin: '0.25rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>{c.strategySubtitle}</p>
+            </div>
+            <button
+              type="button"
+              data-testid="strategy-advanced-toggle"
+              onClick={() => setShowAdvanced(v => !v)}
+              style={{ padding: '0.45rem 0.8rem', borderRadius: 10, cursor: 'pointer', fontSize: '0.76rem', fontWeight: 600, border: '1px solid rgba(255,255,255,0.14)', background: showAdvanced ? 'rgba(255,107,53,0.16)' : 'transparent', color: showAdvanced ? 'var(--primary)' : 'var(--text-secondary)' }}
+            >
+              {showAdvanced ? c.materialAdvancedOff : c.materialAdvancedOn}
+            </button>
           </div>
 
+          <MaterialFinder
+            key={`material-${materialKey}`}
+            c={c}
+            language={language}
+            spec={spec}
+            initial={materialState}
+            durationSec={targetDuration}
+            aiReady={aiCopy && !!apiKey.trim()}
+            apiKey={apiKey}
+            provider={provider}
+            model={model}
+            baseUrl={baseUrl}
+            onToast={onToast}
+            onSendToStudio={onSendToStudio || (() => undefined)}
+            onPersist={setMaterialState}
+          />
+
+          {showAdvanced ? (
+          <>
           {!timedSources && (
             <div
               data-testid="strategy-no-sources"
@@ -1370,6 +1435,12 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                   </div>
                 </div>
               </div>
+            </div>
+          )}
+          </>
+          ) : (
+            <div data-testid="material-advanced-hint" style={{ fontSize: '0.76rem', color: 'var(--text-muted)', borderTop: '1px solid var(--border-color)', paddingTop: '0.75rem' }}>
+              💡 {c.materialAdvancedHint}
             </div>
           )}
         </section>

@@ -1691,6 +1691,12 @@ Transcript:
           model={selectedModel}
           baseUrl={aiBaseUrl}
           onToast={setToastMessage}
+          onSendToStudio={(materialUrl) => {
+            // Fast hand-off: a material link found by the finder becomes the
+            // studio's next analysis target instead of a copy-paste round trip.
+            setUrl(materialUrl);
+            setView('studio');
+          }}
         />
       ) : view === 'downloader' ? (
         <VideoDownloaderPage onToast={setToastMessage} />

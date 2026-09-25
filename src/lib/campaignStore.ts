@@ -16,6 +16,7 @@
 // retried once — an old session must never block the current one.
 
 import type { CampaignSpec, CreativeStrategy, PrepPlan } from '../CampaignPage';
+import type { MaterialPack } from '../components/MaterialFinder';
 import type { WindowTranscript } from './transcript';
 
 const SESSION_PREFIX = 'heatcut_campaign_session_';
@@ -49,6 +50,14 @@ export interface PrepSession {
   strategy_tone?: string;
   strategy_audience?: string;
   strategy_ideas?: number;
+  /** Material finder output for this brief (beats, links, steps, assets). */
+  material?: MaterialPack | null;
+  material_md?: string;
+  material_subject?: string;
+  material_artist?: string;
+  material_lyrics?: string;
+  material_vibe?: string;
+  material_style?: string;
 }
 
 export interface SessionSummary {
