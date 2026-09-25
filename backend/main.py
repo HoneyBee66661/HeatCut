@@ -4016,6 +4016,11 @@ try:  # same dual-import dance for the creative consultant
 except ImportError:  # pragma: no cover
     import creative as creative_mod  # type: ignore
 
+try:  # ...and for the material finder (what to cut + where to get it)
+    from backend import material as material_mod
+except ImportError:  # pragma: no cover
+    import material as material_mod  # type: ignore
+
 CAMPAIGN_RATE_LIMIT = int(os.environ.get("HEATCUT_CAMPAIGN_RATE_LIMIT", "60"))  # per IP per hour
 CAMPAIGN_RATE_WINDOW = 3600.0
 
@@ -4345,6 +4350,276 @@ async def campaign_strategy(request: CampaignStrategyRequest, http_request: Requ
         "strategy_md": board.get("strategy_md"),
         "copy_note": copy_note,
         "model": board.get("model") or "rules",
+    }
+
+
+# ------------------------------------------------- material finder (WHICH footage)
+# The consultant answers "what should I post?"; this answers the question an
+# average clipper actually gets stuck on — "where do I get the footage?". The
+# pack is deterministic (lyric beats -> shot ideas -> real YouTube search links);
+# live search upgrades those links to ACTUAL videos with a title and duration,
+# and the optional scene pass asks the LLM to name real film scenes per beat.
+
+MATERIAL_SEARCH_CACHE: dict = {}
+MATERIAL_SEARCH_TTL = float(os.environ.get("HEATCUT_MATERIAL_SEARCH_TTL", "21600"))  # 6h
+MATERIAL_SEARCH_CONCURRENCY = int(os.environ.get("HEATCUT_MATERIAL_SEARCH_CONCURRENCY", "2"))
+MATERIAL_SEARCH_LIMIT = int(os.environ.get("HEATCUT_CAMPAIGN_MATERIAL_SEARCH_RATE", "180"))  # per IP per hour
+
+
+class CampaignMaterialRequest(BaseModel):
+    spec: Optional[dict] = Field(None, description="Parsed campaign spec (optional: the finder works standalone)")
+    subject: Optional[str] = Field(None, description="What is being promoted — the song title, product or service")
+    artist: Optional[str] = Field(None, description="Artist / brand name for a song")
+    lyrics: Optional[str] = Field(None, description="Paste the lyrics: each line becomes a beat with its own shot idea and links")
+    prompt: Optional[str] = Field(None, description="Creative direction from the user")
+    language: Optional[str] = Field("en", description="'en' or 'id'")
+    vibe: Optional[str] = Field("auto", description="auto | hype | sad | romantic | nostalgic | bold | chill")
+    style: Optional[str] = Field("auto", description="auto | movie_edit | lyric_video | story | product_demo | broll")
+    platform: Optional[str] = Field(None, description="Where it will be posted (defaults to the brief's platforms)")
+    duration_sec: Optional[float] = Field(None, description="Target clip length in seconds")
+    beat_count: int = Field(6, description="How many lyric beats to plan (3-12)")
+    live: bool = Field(False, description="Also run the live YouTube search for this many beats now")
+    live_limit: int = Field(3, description="Results per live query (1-6)")
+    generate_scenes: bool = Field(False, description="Optional LLM pass: name real film scenes per beat (needs api_key)")
+    api_key: Optional[str] = None
+    provider: Optional[str] = "gemini"
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+class CampaignMaterialSearchRequest(BaseModel):
+    queries: List[str] = Field(..., description="Search queries to run on YouTube (each returns real videos)")
+    limit: int = Field(4, description="Results per query (1-8)")
+
+
+def _fmt_seconds_label(seconds) -> str:
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    if total < 3600:
+        return f"{total // 60}:{total % 60:02d}"
+    return f"{total // 3600}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
+def _youtube_search_sync(query: str, limit: int = 4) -> List[dict]:
+    """Relevance-ordered YouTube search through yt-dlp (no API key, no quota).
+    Flat extraction: metadata only, no media fetched, ~3-5s per query."""
+    import yt_dlp  # lazy: keeps cold start light
+
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "noplaylist": True,
+        "socket_timeout": 15,
+        "ignoreerrors": True,
+    }
+    opts.update(_yt_env_opts())
+    cookie = get_yt_cookiefile()
+    if cookie:
+        opts["cookiefile"] = cookie
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{max(1, min(int(limit), 8))}:{query}", download=False) or {}
+    def _rank(entry: dict) -> int:
+        # Long ASMR/full-movie uploads match a query but are useless for a 30s
+        # edit — relevance order is kept, they just sink to the bottom.
+        return 1 if (entry.get("duration") or 0) > 1200 else 0
+
+    results: List[dict] = []
+    for entry in (info.get("entries") or []):
+        if not isinstance(entry, dict):
+            continue
+        vid = str(entry.get("id") or "").strip()
+        if not vid or len(vid) < 6:
+            continue
+        if (entry.get("duration") or 0) > 7200:  # 2h+: a sleep/ambience loop, never a scene
+            continue
+        results.append({
+            "video_id": vid,
+            "title": str(entry.get("title") or "").strip()[:160],
+            "url": material_mod.watch_url(vid),
+            "channel": str(entry.get("channel") or entry.get("uploader") or "").strip()[:80],
+            "duration": entry.get("duration"),
+            "duration_label": _fmt_seconds_label(entry.get("duration")),
+            "views": entry.get("view_count"),
+            "thumbnail": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+        })
+    results.sort(key=_rank)  # stable sort: relevance order survives inside each group
+    return results
+
+
+def _cached_youtube_search(query: str, limit: int) -> List[dict]:
+    key = f"{query.strip().lower()}|{int(limit)}"
+    now = time.time()
+    hit = MATERIAL_SEARCH_CACHE.get(key)
+    if hit and now - hit[0] < MATERIAL_SEARCH_TTL:
+        return hit[1]
+    results = _youtube_search_sync(query, limit)
+    MATERIAL_SEARCH_CACHE[key] = (now, results)
+    if len(MATERIAL_SEARCH_CACHE) > 800:  # bounded: search results are small
+        for stale in sorted(MATERIAL_SEARCH_CACHE, key=lambda k: MATERIAL_SEARCH_CACHE[k][0])[:200]:
+            MATERIAL_SEARCH_CACHE.pop(stale, None)
+    return results
+
+
+async def _material_live_search(queries: List[str], limit: int = 4) -> dict:
+    """Run the searches concurrently (bounded). A query that fails is reported as
+    empty — the search LINK always remains usable."""
+    sem = asyncio.Semaphore(max(1, MATERIAL_SEARCH_CONCURRENCY))
+
+    async def one(query: str) -> tuple:
+        async with sem:
+            try:
+                return query, await asyncio.wait_for(
+                    asyncio.to_thread(_cached_youtube_search, query, limit), timeout=45,
+                )
+            except Exception as e:  # noqa: BLE001 — best effort, never fails the pack
+                logger.info("Material live search failed for %r (%s)", query[:60], str(e)[:120])
+                return query, []
+
+    pairs = await asyncio.gather(*[one(q) for q in queries]) if queries else []
+    return {q: r for q, r in pairs}
+
+
+def _campaign_material_llm(pack: dict, spec: dict, provider: str, model: str, api_key: str,
+                           base_url: Optional[str], language: str) -> tuple:
+    """Optional scene-picker pass: name real film scenes per lyric beat."""
+    prompt = material_mod.material_prompt(pack, spec, language)
+    if provider == "gemini":
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.6),
+        )
+        raw = resp.text or ""
+    else:
+        raw = _provider_llm_call(
+            provider, model, prompt, api_key, base_url,
+            json_instruction="\n\nRespond with ONLY the JSON object described above — no markdown, no commentary.",
+            system="You are a film-literate music-video editor. Never invent a film that does not exist.",
+        )
+    parsed = _parse_json_response(raw) or {}
+    applied = material_mod.apply_llm_material(pack, parsed, model)
+    return applied, model
+
+
+@app.post("/api/campaign/material")
+async def campaign_material(request: CampaignMaterialRequest, http_request: Request):
+    """Material finder: lyric-browsable beats, the shot idea for each, the footage
+    to look for (with real YouTube links), the asset list and a plain-language,
+    non-technical step-by-step recipe."""
+    ip = _client_ip(http_request)
+    if _rate_limited(f"campaign-material:{ip}", CAMPAIGN_RATE_LIMIT, CAMPAIGN_RATE_WINDOW):
+        raise HTTPException(status_code=429, detail=(
+            f"Batas pemakaian: maks {CAMPAIGN_RATE_LIMIT} material plan per jam dari IP ini."
+        ))
+
+    spec = request.spec or {}
+    if not any([(request.subject or "").strip(), (request.lyrics or "").strip(),
+                (request.prompt or "").strip(), spec.get("campaign_id")]):
+        raise HTTPException(status_code=400, detail="Tell me what this campaign promotes (a song, a product, a service).")
+
+    language = (request.language or "en").strip().lower()
+    platform = (request.platform or "").strip() or ", ".join(
+        (spec.get("requirements") or {}).get("platforms") or ["TikTok", "Instagram Reels", "YouTube Shorts"]
+    )
+    try:
+        pack = await asyncio.to_thread(
+            material_mod.build_material,
+            spec,
+            request.subject or "",
+            request.artist or "",
+            request.lyrics or "",
+            request.prompt or "",
+            language,
+            request.vibe or "auto",
+            request.style or "auto",
+            platform,
+            request.duration_sec,
+            int(request.beat_count or 6),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Campaign material failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Material plan failed: {e}")
+
+    provider = (request.provider or "gemini").strip().lower()
+    model = (request.model or "gemini-2.5-flash").strip()
+    scene_note = ""
+    if request.generate_scenes:
+        prov_env = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY",
+                    "anthropic": "ANTHROPIC_API_KEY", "openai-compatible": "OPENAI_API_KEY"}.get(provider, "GEMINI_API_KEY")
+        key = (request.api_key or os.environ.get(prov_env) or "").strip()
+        if not key or key.lower() == "mock":
+            scene_note = "Scene ideas skipped: no API key supplied."
+        else:
+            try:
+                applied, used = await asyncio.wait_for(
+                    asyncio.to_thread(_campaign_material_llm, pack, spec, provider, model, key,
+                                      request.base_url, language),
+                    timeout=180,
+                )
+                scene_note = f"{applied} scene idea(s) from {used}." if applied else "The scene pass returned nothing usable."
+            except Exception as e:  # noqa: BLE001
+                logger.info("Campaign material scene pass skipped (%s)", str(e)[:140])
+                scene_note = f"Scene ideas failed ({str(e)[:120]}) — the deterministic plan is unchanged."
+            pack["material_md"] = material_mod.build_material_md(pack, spec)
+
+    live_note = ""
+    if request.live:
+        # one query per beat (its primary scene search) + the song audio query
+        pairs: List[Tuple[dict, str]] = []
+        for beat in (pack.get("beats") or []):
+            searches = beat.get("searches") or []
+            if searches:
+                pairs.append((beat, searches[0]["query"]))
+        targets = pairs[:8]
+        found = await _material_live_search([q for _, q in targets], int(request.live_limit or 3))
+        hits = 0
+        for beat, query in targets:
+            results = found.get(query) or []
+            beat["results"] = results
+            hits += len(results)
+        live_note = f"{hits} real video(s) found for {len(targets)} beat(s)." if hits else "Live search returned nothing — the search links still work."
+
+    pack["material_md"] = material_mod.build_material_md(pack, spec)
+    logger.info(
+        "Campaign %s material: %d beat(s), style=%s, live=%s (%s)",
+        spec.get("campaign_id"), len(pack.get("beats") or []), pack.get("style"),
+        bool(request.live), scene_note or live_note or "rules only",
+    )
+    return {
+        "campaign_id": spec.get("campaign_id"),
+        "material": pack,
+        "material_md": pack.get("material_md"),
+        "scene_note": scene_note,
+        "live_note": live_note,
+        "model": pack.get("model") or "rules",
+    }
+
+
+@app.post("/api/campaign/material/search")
+async def campaign_material_search(request: CampaignMaterialSearchRequest, http_request: Request):
+    """Live YouTube search for specific queries — returns REAL videos (title,
+    channel, duration, link). Best effort: an empty list means "no results", the
+    search link in the pack keeps working either way."""
+    ip = _client_ip(http_request)
+    if _rate_limited(f"campaign-material-search:{ip}", MATERIAL_SEARCH_LIMIT, CAMPAIGN_RATE_WINDOW):
+        raise HTTPException(status_code=429, detail="Terlalu banyak pencarian material. Coba lagi sebentar lagi.")
+
+    queries = [q.strip() for q in (request.queries or []) if str(q or "").strip()][:8]
+    if not queries:
+        raise HTTPException(status_code=400, detail="No search queries supplied.")
+    limit = max(1, min(int(request.limit or 4), 8))
+    found = await _material_live_search(queries, limit)
+    return {
+        "results": found,
+        "counts": {q: len(v) for q, v in found.items()},
+        "total": sum(len(v) for v in found.values()),
     }
 
 
