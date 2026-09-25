@@ -15,7 +15,7 @@
 // refuses (quota exceeded) the OLDEST sessions are dropped and the write is
 // retried once — an old session must never block the current one.
 
-import type { CampaignSpec, PrepPlan } from '../CampaignPage';
+import type { CampaignSpec, CreativeStrategy, PrepPlan } from '../CampaignPage';
 import type { WindowTranscript } from './transcript';
 
 const SESSION_PREFIX = 'heatcut_campaign_session_';
@@ -42,6 +42,13 @@ export interface PrepSession {
   exported: Record<string, number>;
   /** item id → caption text + SRT. */
   transcripts: Record<string, WindowTranscript>;
+  /** Creative board for this brief (the consultant's output, if built). */
+  strategy?: CreativeStrategy | null;
+  strategy_md?: string;
+  strategy_prompt?: string;
+  strategy_tone?: string;
+  strategy_audience?: string;
+  strategy_ideas?: number;
 }
 
 export interface SessionSummary {

@@ -95,6 +95,73 @@ export interface PrepPlan {
   campaign_name?: string;
 }
 
+export interface StrategyIdea {
+  id: string;
+  angle: string;
+  angle_key: string;
+  topic: string;
+  platform: string;
+  aspect_ratio: string;
+  duration_sec: number;
+  hook: string;
+  title: string;
+  title_alt: string;
+  caption: string;
+  hashtags: string[];
+  why_it_works: string;
+  retention_device: string;
+  cta: string;
+  shot_list: string[];
+  text_overlay: string[];
+}
+
+export interface StrategyMarketing {
+  positioning?: { brand?: string; audience?: string; niches?: string[]; angle_mix?: string[]; tone?: string };
+  hook_window_sec?: number;
+  retention_target_pct?: number;
+  loopability?: string;
+  caption_rules?: string[];
+  hashtag_mix?: { branded?: string[]; niche?: string[]; broad?: string[]; rule?: string };
+  posting?: {
+    per_account_limit?: number | null;
+    cadence?: string;
+    best_windows?: Record<string, string[]>;
+    batch_rule?: string;
+  };
+  sound?: string;
+  cover_frame?: string;
+  text_overlay?: string;
+  kpi?: Record<string, string | number | null>;
+  ab_test?: Record<string, string | number>;
+  optimization_loop?: string[];
+  asset_guidance?: string[];
+  llm_tactics?: string[];
+}
+
+export interface CreativeStrategy {
+  version: number;
+  source: string;
+  model?: string;
+  campaign_id?: string;
+  campaign_name?: string;
+  has_timed_sources: boolean;
+  topics: string[];
+  prompt: string;
+  language: string;
+  ideas: StrategyIdea[];
+  marketing: StrategyMarketing;
+  compliance: { rules: string[]; do_not: string[]; checklist: string[]; prompt_conflicts: string[] };
+  notes: string[];
+}
+
+export interface StrategyResponse {
+  campaign_id?: string;
+  strategy: CreativeStrategy;
+  strategy_md: string;
+  copy_note?: string;
+  model: string;
+}
+
 interface CampaignPageProps {
   apiKey: string;
   provider: string;
@@ -120,7 +187,7 @@ const fmt = (sec: number): string => {
 };
 
 export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast }: CampaignPageProps) {
-  const { t } = useLanguage();
+  const { t, language } = useLanguage();
   const c = t.campaign;
 
   const [url, setUrl] = useState(readLastUrl);
@@ -150,6 +217,15 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
   const [perSource, setPerSource] = useState(4);
   const [maxTotal, setMaxTotal] = useState(15);
   const [aiCopy, setAiCopy] = useState(false);
+  // Creative consultant (the brief is the data source, especially when the
+  // campaign ships no timestamped videos to cut).
+  const [strategyPrompt, setStrategyPrompt] = useState('');
+  const [strategyTone, setStrategyTone] = useState('auto');
+  const [strategyAudience, setStrategyAudience] = useState('');
+  const [strategyIdeaCount, setStrategyIdeaCount] = useState(10);
+  const [strategy, setStrategy] = useState<CreativeStrategy | null>(null);
+  const [strategyMd, setStrategyMd] = useState('');
+  const [strategyBusy, setStrategyBusy] = useState(false);
   const [exportingKey, setExportingKey] = useState<string | null>(null);
   const [bulk, setBulk] = useState<{ done: number; total: number } | null>(null);
   const [bulkZip, setBulkZip] = useState(false);
@@ -216,6 +292,9 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       setTranscripts({});
       setManual({});
       setPlan(null);
+      // The board belongs to the campaign it was built from.
+      setStrategy(null);
+      setStrategyMd('');
       if (!(parsed.sources || []).length) {
         toast(parsed.warnings?.[0] || c.noClips, 6000);
       } else {
@@ -267,6 +346,87 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     }
   };
 
+  // ------------------------------------------------------ creative consultant
+
+  /** Does the brief give us anything to actually cut? */
+  const timedSources = useMemo(
+    () => (spec?.sources || []).some(s => (s.timestamps || []).length > 0),
+    [spec],
+  );
+
+  /**
+   * Turn the BRIEF into a creative board: angles, per-idea hook/title(A/B)/
+   * caption/hashtags, the digital-marketing levers to optimize and a compliance
+   * checklist. Deterministic server-side; the optional AI polish reuses the same
+   * AI settings as the copy pass.
+   */
+  const handleStrategy = async () => {
+    if (!spec || strategyBusy) return;
+    setStrategyBusy(true);
+    setError(null);
+    try {
+      const resp = await fetch('/api/campaign/strategy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          spec,
+          prompt: strategyPrompt.trim() || undefined,
+          language,
+          tone: strategyTone,
+          audience: strategyAudience.trim() || undefined,
+          idea_count: strategyIdeaCount,
+          generate_copy: aiCopy,
+          api_key: aiCopy ? apiKey.trim() || undefined : undefined,
+          provider: aiCopy ? provider : undefined,
+          model: aiCopy ? model : undefined,
+          base_url: aiCopy && provider === 'openai-compatible' ? baseUrl.trim() || undefined : undefined,
+        }),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) throw new Error(data?.detail || `Server error ${resp.status}`);
+      const parsed = data as StrategyResponse;
+      setStrategy(parsed.strategy);
+      setStrategyMd(parsed.strategy_md || '');
+      if (parsed.copy_note) toast(parsed.copy_note, 6000);
+      else toast(c.strategyReady((parsed.strategy?.ideas || []).length), 4000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStrategyBusy(false);
+    }
+  };
+
+  /** One idea as plain text — the clipboard hand-off the editor pastes into CapCut. */
+  const ideaText = (idea: StrategyIdea): string => [
+    `#${idea.id.replace('idea-', '')} · ${idea.angle} · ${idea.platform} · ~${idea.duration_sec}s ${idea.aspect_ratio}`,
+    `${c.strategyHookLabel}: ${idea.hook}`,
+    `${c.strategyTitleALabel}: ${idea.title}`,
+    `${c.strategyTitleBLabel}: ${idea.title_alt}`,
+    `${c.strategyCaptionLabel}: ${idea.caption}`,
+    `${c.strategyHashtagLabel}: ${idea.hashtags.join(' ')}`,
+    `${c.strategyWhyLabel}: ${idea.why_it_works}`,
+  ].join('\n');
+
+  const copyIdeas = () => {
+    const text = (strategy?.ideas || []).map(ideaText).join('\n\n');
+    if (text) copyText(text, c.strategyIdeasTitle);
+    else toast(c.strategyEmpty, 4000);
+  };
+
+  const copyStrategyMd = () => {
+    if (strategyMd) copyText(strategyMd, c.strategyTitle);
+    else toast(c.strategyEmpty, 4000);
+  };
+
+  const downloadStrategyMd = () => {
+    if (!strategyMd) {
+      toast(c.strategyEmpty, 4000);
+      return;
+    }
+    saveBlob(new Blob([strategyMd], { type: 'text/markdown' }),
+             `heatcut_campaign_${spec?.campaign_id || 'strategy'}_strategy.md`);
+  };
+
   const markManual = (key: string, message: string) =>
     setManual(prev => ({ ...prev, [key]: message }));
 
@@ -299,8 +459,12 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       max_clips: maxTotal,
       ai_copy: aiCopy,
       manual, exported, transcripts,
+      strategy, strategy_md: strategyMd,
+      strategy_prompt: strategyPrompt, strategy_tone: strategyTone,
+      strategy_audience: strategyAudience, strategy_ideas: strategyIdeaCount,
     };
-  }, [spec, plan, selected, url, targetDuration, perSource, maxTotal, aiCopy, manual, exported, transcripts]);
+  }, [spec, plan, selected, url, targetDuration, perSource, maxTotal, aiCopy, manual, exported, transcripts,
+      strategy, strategyMd, strategyPrompt, strategyTone, strategyAudience, strategyIdeaCount]);
 
   // Debounced auto-save: a new plan, a finished download or a fresh caption
   // lands in localStorage within a second of the UI going idle.
@@ -334,6 +498,12 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     setManual(session.manual || {});
     setExported(session.exported || {});
     setTranscripts(session.transcripts || {});
+    setStrategy(session.strategy || null);
+    setStrategyMd(session.strategy_md || '');
+    setStrategyPrompt(session.strategy_prompt || '');
+    setStrategyTone(session.strategy_tone || 'auto');
+    setStrategyAudience(session.strategy_audience || '');
+    setStrategyIdeaCount(session.strategy_ideas || 10);
     setFallback(null);
     setError(null);
     toast(c.sessionLoaded(session.label), 6000);
@@ -545,10 +715,42 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     if (captions) {
       entries.push(await zipEntry('CAPTIONS.md', new Blob([captions], { type: 'text/markdown' })));
     }
+    // The creative board rides along when the user built one.
+    if (strategyMd) {
+      entries.push(await zipEntry('STRATEGY.md', new Blob([strategyMd], { type: 'text/markdown' })));
+    }
     saveBlob(buildZip(entries), `heatcut_campaign_${plan.campaign_id || 'pack'}_raw.zip`);
     setBulk(null);
     setBulkZip(false);
     toast(c.zipDone(entries.filter(e => e.name.endsWith('.mp4')).length, blocked.length, srtCount), 9000);
+  };
+
+  /**
+   * Source-less briefs have no clips to fetch, so `downloadZipAll` can never run
+   * for them. The board is still a deliverable: one archive with STRATEGY.md (+
+   * BRIEF.md once a plan exists) — still ONE download, no permission gate.
+   */
+  const downloadStrategyPack = async () => {
+    if (!strategyMd || bulkZip) return;
+    setBulkZip(true);
+    try {
+      const entries: ZipEntry[] = [
+        await zipEntry('STRATEGY.md', new Blob([strategyMd], { type: 'text/markdown' })),
+      ];
+      if (plan?.brief_md) {
+        entries.push(await zipEntry('BRIEF.md', new Blob([plan.brief_md], { type: 'text/markdown' })));
+      }
+      if (strategy) {
+        const ideas = strategy.ideas.map(ideaText).join('\n\n');
+        entries.push(await zipEntry('IDEAS.txt', new Blob([ideas], { type: 'text/plain' })));
+      }
+      saveBlob(buildZip(entries), `heatcut_campaign_${spec?.campaign_id || 'strategy'}_strategy.zip`);
+      toast(c.strategyZipDone(entries.length), 8000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBulkZip(false);
+    }
   };
 
   // ------------------------------------------------- captions (text + SRT)
@@ -643,6 +845,35 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     <div key={label} style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 110 }}>
       <span style={{ fontSize: '0.68rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{label}</span>
       <span style={{ fontSize: '0.95rem', fontWeight: 700, color: 'var(--text-primary)' }}>{value}</span>
+    </div>
+  );
+
+  /** `hook_window_sec` → `Hook window sec` — keeps the marketing table readable
+   *  without a locale key per metric the rules engine emits. */
+  const kvLabel = (key: string): string =>
+    key.replace(/_/g, ' ').replace(/\bpct\b/gi, '(%)').replace(/^./, (ch) => ch.toUpperCase());
+
+  const kvRows = (obj?: Record<string, unknown>) =>
+    Object.entries(obj || {})
+      .filter(([, v]) => v !== null && v !== undefined && String(v).length > 0)
+      .map(([k, v]) => (
+        <div key={k} data-testid={`strategy-kv-${k}`} style={{ display: 'flex', gap: '0.6rem', fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+          <span style={{ minWidth: 172, color: 'var(--text-muted)', fontWeight: 600 }}>{kvLabel(k)}</span>
+          <span style={{ flex: 1 }}>{Array.isArray(v) ? (v as unknown[]).join(', ') : String(v)}</span>
+        </div>
+      ));
+
+  const bulletList = (items?: string[], color?: string) => (
+    <ul style={{ margin: 0, paddingLeft: '1.1rem', fontSize: '0.78rem', color: color || 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+      {(items || []).map((item, i) => <li key={i}>{item}</li>)}
+    </ul>
+  );
+
+  const chipRow = (items?: string[], tone: 'meta' | 'high' = 'meta') => (
+    <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap' }}>
+      {(items || []).map((item, i) => (
+        <span key={i} className={`score-badge score-${tone}`} style={{ fontSize: '0.66rem' }}>{item}</span>
+      ))}
     </div>
   );
 
@@ -893,6 +1124,254 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
               </label>
             ))}
           </div>
+        </section>
+      )}
+
+      {/* Creative consultant — when the brief has no cuttable sources, the brief
+          itself is the data: angles, copy, marketing levers, compliance. */}
+      {spec && (
+        <section className="glass-panel" data-testid="strategy-card" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: '1.05rem' }}>🧠 {c.strategyTitle}</h3>
+            <p style={{ margin: '0.25rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>{c.strategySubtitle}</p>
+          </div>
+
+          {!timedSources && (
+            <div
+              data-testid="strategy-no-sources"
+              style={{ padding: '0.6rem 0.85rem', borderRadius: 10, fontSize: '0.8rem', background: 'rgba(255, 94, 58, 0.08)', border: '1px solid rgba(255, 94, 58, 0.3)', color: 'var(--secondary)' }}
+            >
+              ⚠️ {c.strategyNoSources}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <label style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{c.strategyPromptLabel}</label>
+            <textarea
+              data-testid="strategy-prompt"
+              className="form-input"
+              rows={3}
+              style={{ resize: 'vertical', fontFamily: 'inherit' }}
+              placeholder={c.strategyPromptPlaceholder}
+              value={strategyPrompt}
+              onChange={(e) => setStrategyPrompt(e.target.value)}
+            />
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.9rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+              <label style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyToneLabel}</label>
+              <select
+                data-testid="strategy-tone"
+                className="form-input"
+                value={strategyTone}
+                onChange={(e) => setStrategyTone(e.target.value)}
+                style={{ padding: '0.4rem 0.6rem', fontSize: '0.82rem' }}
+              >
+                <option value="auto">{c.toneAuto}</option>
+                <option value="punchy">{c.tonePunchy}</option>
+                <option value="story">{c.toneStory}</option>
+                <option value="educational">{c.toneEducational}</option>
+                <option value="funny">{c.toneFunny}</option>
+              </select>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', flex: 1, minWidth: 220 }}>
+              <label style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyAudienceLabel}</label>
+              <input
+                type="text"
+                data-testid="strategy-audience"
+                className="form-input"
+                placeholder={c.strategyAudiencePlaceholder}
+                value={strategyAudience}
+                onChange={(e) => setStrategyAudience(e.target.value)}
+              />
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+              <label style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyIdeasLabel}</label>
+              <input
+                type="number"
+                data-testid="strategy-idea-count"
+                className="form-input"
+                min={4}
+                max={20}
+                value={strategyIdeaCount}
+                onChange={(e) => setStrategyIdeaCount(Math.max(4, Math.min(20, Number(e.target.value) || 10)))}
+                style={{ width: 92 }}
+              />
+            </div>
+
+            <button
+              type="button"
+              className="glowing-btn"
+              data-testid="strategy-generate"
+              onClick={handleStrategy}
+              disabled={strategyBusy}
+              style={{ height: 44, padding: '0 1.6rem' }}
+            >
+              {strategyBusy ? c.strategyGenerating : c.strategyGenerate}
+            </button>
+          </div>
+
+          <p style={{ margin: 0, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+            {c.strategyHint} {c.strategyAiNote}
+          </p>
+
+          {strategy && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', borderTop: '1px solid var(--border-color)', paddingTop: '1rem' }}>
+              <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                <span className="score-badge score-high" style={{ fontSize: '0.68rem' }}>
+                  {strategy.source === 'rules+llm' ? c.strategySourceLlm : c.strategySourceRules}
+                </span>
+                {strategy.model && <span className="score-badge score-meta" style={{ fontSize: '0.68rem' }}>{strategy.model}</span>}
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                  {c.strategyAudienceOut}: {strategy.marketing?.positioning?.audience}
+                </span>
+              </div>
+
+              {!!(strategy.topics || []).length && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                  <span style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyTopics}</span>
+                  {chipRow(strategy.topics)}
+                </div>
+              )}
+
+              {!!(strategy.notes || []).length && (
+                <div data-testid="strategy-notes" style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                  {strategy.notes.map((n, i) => <div key={i}>ℹ️ {n}</div>)}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                <h4 style={{ margin: 0, fontSize: '0.9rem' }}>🎬 {c.strategyIdeasTitle} ({strategy.ideas.length})</h4>
+                <button type="button" onClick={copyIdeas} style={{ background: 'none', border: 'none', color: 'var(--primary)', cursor: 'pointer', fontWeight: 600, fontSize: '0.78rem' }}>
+                  {c.strategyCopyIdeas}
+                </button>
+                <span style={{ color: 'var(--border-color)' }}>|</span>
+                <button type="button" onClick={copyStrategyMd} style={{ background: 'none', border: 'none', color: 'var(--secondary)', cursor: 'pointer', fontWeight: 600, fontSize: '0.78rem' }}>
+                  {c.strategyCopyMd}
+                </button>
+                <span style={{ color: 'var(--border-color)' }}>|</span>
+                <button type="button" data-testid="strategy-download-md" onClick={downloadStrategyMd} style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontWeight: 600, fontSize: '0.78rem' }}>
+                  ⬇ {c.strategyDownloadMd}
+                </button>
+                <span style={{ color: 'var(--border-color)' }}>|</span>
+                <button type="button" data-testid="strategy-download-zip" onClick={downloadStrategyPack} disabled={bulkZip} style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontWeight: 600, fontSize: '0.78rem' }}>
+                  📦 {c.strategyZip}
+                </button>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '0.8rem' }}>
+                {strategy.ideas.map((idea) => (
+                  <div
+                    key={idea.id}
+                    data-testid={`strategy-concept-${idea.id}`}
+                    style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', padding: '0.8rem 0.9rem', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.07)' }}
+                  >
+                    <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <span className="score-badge score-high" style={{ fontSize: '0.66rem' }}>{idea.angle}</span>
+                      <span className="score-badge score-meta" style={{ fontSize: '0.66rem' }}>{idea.platform}</span>
+                      <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>~{idea.duration_sec}s · {idea.aspect_ratio}</span>
+                    </div>
+                    <div style={{ fontSize: '0.82rem', color: 'var(--text-primary)' }}>
+                      <strong style={{ color: 'var(--secondary)' }}>{c.strategyHookLabel}:</strong> {idea.hook}
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                      <strong>{c.strategyTitleALabel}:</strong> {idea.title}
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                      <strong>{c.strategyTitleBLabel}:</strong> {idea.title_alt}
+                    </div>
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{idea.caption}</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--primary)' }}>{idea.hashtags.join(' ')}</div>
+                    <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>💡 {idea.why_it_works}</div>
+                    <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>⏱️ {idea.retention_device}</div>
+                    <details>
+                      <summary style={{ fontSize: '0.74rem', color: 'var(--text-muted)', cursor: 'pointer' }}>{c.strategyShotListLabel}</summary>
+                      <div style={{ marginTop: '0.3rem' }}>{bulletList(idea.shot_list)}</div>
+                    </details>
+                    <button
+                      type="button"
+                      onClick={() => copyText(ideaText(idea), `${c.strategyTitle} ${idea.id}`)}
+                      style={{ alignSelf: 'flex-start', background: 'none', border: 'none', color: 'var(--primary)', cursor: 'pointer', fontWeight: 600, fontSize: '0.74rem' }}
+                    >
+                      📋 {c.strategyCopyIdea}
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '0.9rem' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', padding: '0.85rem', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                  <h4 style={{ margin: 0, fontSize: '0.82rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--secondary)' }}>📈 {c.strategyMarketingTitle}</h4>
+                  {kvRows({
+                    hook_window_sec: strategy.marketing?.hook_window_sec,
+                    retention_target_pct: strategy.marketing?.retention_target_pct,
+                    loopability: strategy.marketing?.loopability,
+                    sound: strategy.marketing?.sound,
+                    cover_frame: strategy.marketing?.cover_frame,
+                    text_overlay: strategy.marketing?.text_overlay,
+                  })}
+                  <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyCaptionRules}</div>
+                  {bulletList(strategy.marketing?.caption_rules)}
+                  <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyHashtagMix}</div>
+                  {kvRows({
+                    branded: strategy.marketing?.hashtag_mix?.branded,
+                    niche: strategy.marketing?.hashtag_mix?.niche,
+                    broad: strategy.marketing?.hashtag_mix?.broad,
+                    rule: strategy.marketing?.hashtag_mix?.rule,
+                  })}
+                  <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyPosting}</div>
+                  {kvRows({
+                    per_account_limit: strategy.marketing?.posting?.per_account_limit,
+                    cadence: strategy.marketing?.posting?.cadence,
+                    best_windows: strategy.marketing?.posting?.best_windows
+                      ? Object.entries(strategy.marketing.posting.best_windows).map(([p, w]) => `${p}: ${(w || []).join(', ')}`)
+                      : undefined,
+                    batch_rule: strategy.marketing?.posting?.batch_rule,
+                  })}
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', padding: '0.85rem', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                  <h4 style={{ margin: 0, fontSize: '0.82rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--accent)' }}>🎯 {c.strategyKpi}</h4>
+                  {kvRows(strategy.marketing?.kpi as Record<string, unknown>)}
+                  <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyAbTest}</div>
+                  {kvRows(strategy.marketing?.ab_test as Record<string, unknown>)}
+                  <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyLoop}</div>
+                  {bulletList(strategy.marketing?.optimization_loop)}
+                  {!!(strategy.marketing?.llm_tactics || []).length && (
+                    <>
+                      <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyTactics}</div>
+                      {bulletList(strategy.marketing?.llm_tactics)}
+                    </>
+                  )}
+                  <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyAssets}</div>
+                  {bulletList(strategy.marketing?.asset_guidance)}
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', padding: '0.85rem', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                  <h4 style={{ margin: 0, fontSize: '0.82rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--secondary)' }}>🛡️ {c.strategyComplianceTitle}</h4>
+                  <div style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-muted)', fontWeight: 700 }}>{c.strategyChecklist}</div>
+                  {bulletList(strategy.compliance?.checklist)}
+                  {!!(strategy.compliance?.do_not || []).length && (
+                    <>
+                      <div style={{ marginTop: '0.3rem', fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.06em', color: '#fca5a5', fontWeight: 700 }}>{c.strategyDoNot}</div>
+                      {bulletList(strategy.compliance.do_not, '#fca5a5')}
+                    </>
+                  )}
+                  <div
+                    data-testid="strategy-conflicts"
+                    style={{ marginTop: '0.35rem', fontSize: '0.76rem', color: (strategy.compliance?.prompt_conflicts || []).length ? '#fca5a5' : 'var(--text-muted)' }}
+                  >
+                    {(strategy.compliance?.prompt_conflicts || []).length
+                      ? <>⚠️ {c.strategyConflicts}: {strategy.compliance.prompt_conflicts.join(' · ')}</>
+                      : <>✅ {c.strategyNoConflicts}</>}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </section>
       )}
 

@@ -4011,6 +4011,11 @@ try:  # uvicorn backend.main:app (repo root on sys.path) vs Vercel (backend/ on 
 except ImportError:  # pragma: no cover
     import campaign as campaign_mod  # type: ignore
 
+try:  # same dual-import dance for the creative consultant
+    from backend import creative as creative_mod
+except ImportError:  # pragma: no cover
+    import creative as creative_mod  # type: ignore
+
 CAMPAIGN_RATE_LIMIT = int(os.environ.get("HEATCUT_CAMPAIGN_RATE_LIMIT", "60"))  # per IP per hour
 CAMPAIGN_RATE_WINDOW = 3600.0
 
@@ -4220,6 +4225,127 @@ async def campaign_prep(request: CampaignPrepRequest):
         spec.get("campaign_id"), len(plan.get("items") or []), len(urls), copy_note or "no copy pass",
     )
     return plan
+
+
+# ------------------------------------------------- creative strategy (consultant)
+# Some campaigns ship NO concrete source videos — the brief only describes the
+# product, the platforms, the rules and the payout. Prep then has nothing to cut.
+# This route treats the BRIEF as the data source: it builds the creative board a
+# marketing team would hand to an editor (angles, hook/title/caption/hashtag per
+# idea, the digital-marketing levers to optimize, an A/B plan, a compliance
+# checklist). Deterministic by default — no key needed; an optional LLM polish
+# upgrades the wording, exactly like the campaign copy pass.
+
+class CampaignStrategyRequest(BaseModel):
+    spec: dict = Field(..., description="Parsed campaign spec from /api/campaign/parse")
+    prompt: Optional[str] = Field(None, description="Creative direction: product, audience, angle, do/don't, CTA")
+    language: Optional[str] = Field("en", description="Copy language for the board: 'en' or 'id'")
+    tone: Optional[str] = Field("auto", description="'auto', 'punchy', 'story', 'educational' or 'funny'")
+    niche: Optional[str] = Field(None, description="Override the niche/topic seed")
+    audience: Optional[str] = Field(None, description="Who the clips are for")
+    platform_focus: Optional[List[str]] = Field(None, description="Restrict the board to these platforms")
+    idea_count: int = Field(10, description="How many clip concepts to generate (4-20)")
+    generate_copy: bool = Field(False, description="Run the optional LLM polish (needs api_key)")
+    api_key: Optional[str] = None
+    provider: Optional[str] = Field(default="gemini", description="'gemini', 'openai', 'anthropic' or 'openai-compatible'")
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+def _campaign_strategy_llm(board: dict, spec: dict, provider: str, model: str,
+                           api_key: str, base_url: Optional[str], language: str) -> tuple:
+    """One LLM call that upgrades the deterministic board's wording. Best effort:
+    any failure leaves the board exactly as the rules engine built it."""
+    prompt = creative_mod.strategy_prompt(board, spec, language)
+    if provider == "gemini":
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.7),
+        )
+        raw = resp.text or ""
+    else:
+        raw = _provider_llm_call(
+            provider, model, prompt, api_key, base_url,
+            json_instruction="\n\nRespond with ONLY the JSON object described above — no markdown, no commentary.",
+            system="You are a short-form creative director who always obeys the campaign's brand-safety rules.",
+        )
+    parsed = _parse_json_response(raw) or {}
+    applied = creative_mod.apply_llm_strategy(board, parsed, model)
+    return applied, model
+
+
+@app.post("/api/campaign/strategy")
+async def campaign_strategy(request: CampaignStrategyRequest, http_request: Request):
+    """Creative consultant for a campaign brief: idea board + copy + the
+    digital-marketing parameters worth optimizing + compliance checklist."""
+    ip = _client_ip(http_request)
+    if _rate_limited(f"campaign-strategy:{ip}", CAMPAIGN_RATE_LIMIT, CAMPAIGN_RATE_WINDOW):
+        raise HTTPException(status_code=429, detail=(
+            f"Batas pemakaian: maks {CAMPAIGN_RATE_LIMIT} strategy build per jam dari IP ini."
+        ))
+
+    spec = request.spec or {}
+    if not spec.get("campaign_id") and not spec.get("name") and not spec.get("sources"):
+        raise HTTPException(status_code=400, detail="No campaign spec supplied — parse the campaign link first.")
+
+    language = (request.language or "en").strip().lower()
+    try:
+        board = await asyncio.to_thread(
+            creative_mod.build_strategy,
+            spec,
+            request.prompt or "",
+            language,
+            request.tone or "auto",
+            request.niche,
+            request.audience,
+            request.platform_focus,
+            int(request.idea_count or 10),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Campaign strategy failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Strategy build failed: {e}")
+
+    provider = (request.provider or "gemini").strip().lower()
+    model = (request.model or "gemini-2.5-flash").strip()
+    copy_note = ""
+    if request.generate_copy:
+        prov_env = {
+            "gemini": "GEMINI_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai-compatible": "OPENAI_API_KEY",
+        }.get(provider, "GEMINI_API_KEY")
+        key = (request.api_key or os.environ.get(prov_env) or "").strip()
+        if not key or key.lower() == "mock":
+            copy_note = "AI polish skipped: no API key supplied — deterministic board kept."
+        else:
+            try:
+                applied, used_model = await asyncio.wait_for(
+                    asyncio.to_thread(_campaign_strategy_llm, board, spec, provider, model, key,
+                                      request.base_url, language),
+                    timeout=180,
+                )
+                copy_note = f"AI polish applied to {applied} idea(s) with {used_model}."
+                if applied == 0:
+                    copy_note = "AI polish returned nothing usable — deterministic board kept."
+            except Exception as e:  # noqa: BLE001 — polish is an upgrade, never a hard failure
+                logger.info(f"Campaign strategy polish skipped ({str(e)[:140]})")
+                copy_note = f"AI polish failed ({str(e)[:120]}) — deterministic board kept."
+
+    board["strategy_md"] = creative_mod.build_strategy_md(board, spec)
+    logger.info(
+        "Campaign %s strategy: %d idea(s), engine=%s (%s)",
+        spec.get("campaign_id"), len(board.get("ideas") or []), board.get("source"), copy_note or "rules only",
+    )
+    return {
+        "campaign_id": spec.get("campaign_id"),
+        "strategy": board,
+        "strategy_md": board.get("strategy_md"),
+        "copy_note": copy_note,
+        "model": board.get("model") or "rules",
+    }
 
 
 # --------------------------------------------------------------- transcript/SRT
