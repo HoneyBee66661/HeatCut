@@ -420,7 +420,7 @@ class ViralClip(BaseModel):
     virality_score: int = Field(description="Virality score 1-100")
     key_quotes: List[str] = Field(description="1-2 key quotes from the clip")
     transcript: str = Field(description="Spoken text of the clip")
-    title_suggestion: str = Field(default="", description="Catchy alternative title suggestion")
+    title_suggestion: str = Field(default="", description="Catchy alternative title suggestion in third person (never 'I'/'me'/'my'/'saya' — frame the speaker or the topic instead)")
     caption_suggestion: str = Field(default="", description="Engaging social media caption suggestion")
     hashtag_suggestion: str = Field(default="", description="Relevant hashtags suggestion (e.g. #hashtag1 #hashtag2)")
     signal: Optional[str] = Field(default=None, description="Evidence source: 'retention', 'text', or 'both'")
@@ -434,7 +434,7 @@ class ViralClipGemini(BaseModel):
     hook_time: float = Field(description="Absolute timestamp in seconds from video start where the potential hook occurs inside this clip range (must be >= start_time and <= end_time)")
     virality_score: int = Field(description="Virality score 1-100")
     key_quotes: List[str] = Field(description="1-2 key quotes from the clip")
-    title_suggestion: str = Field(default="", description="Catchy alternative title suggestion")
+    title_suggestion: str = Field(default="", description="Catchy alternative title suggestion in third person (never 'I'/'me'/'my'/'saya' — frame the speaker or the topic instead)")
     caption_suggestion: str = Field(default="", description="Engaging social media caption suggestion")
     hashtag_suggestion: str = Field(default="", description="Relevant hashtags suggestion (e.g. #hashtag1 #hashtag2)")
 
@@ -619,10 +619,10 @@ def parse_manual_subtitles(content: str, default_duration: float = 0.0) -> List[
 
 def extract_video_id(url: str) -> Optional[str]:
     """Extracts the 11-character YouTube video ID from various URL formats."""
-    # Handle shorts, embed, watch?v=, youtu.be, etc.
+    # Handle shorts, live, embed, watch?v=, youtu.be, m.youtube.com, etc.
     patterns = [
-        r"(?:v=|\/v\/|embed\/|shorts\/|youtu\.be\/|\/embed\/|\/watch\?v=|\/watch\?.+&v=)([^#\&\?]{11})",
-        r"^(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([^#\&\?]{11})"
+        r"(?:v=|\/v\/|embed\/|shorts\/|live\/|youtu\.be\/|\/embed\/|\/watch\?v=|\/watch\?.+&v=)([^#\&\?]{11})",
+        r"^(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([^#\&\?]{11})"
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
@@ -631,6 +631,52 @@ def extract_video_id(url: str) -> Optional[str]:
     # Simple length check fallback if the user just pasted the ID
     if len(url.strip()) == 11:
         return url.strip()
+    return None
+
+def get_youtube_oembed_title(video_id_or_url: str) -> Optional[str]:
+    """Resolves a real video title via YouTube's public oEmbed endpoint.
+
+    Deliberately NOT a scrape: oEmbed answers with JSON, needs no cookies and
+    never trips the bot-check that yt-dlp extraction hits from datacenter IPs,
+    so it can backfill titles (history cards) in milliseconds. Falls back to the
+    watch page's <title> tag when oEmbed is unavailable.
+    """
+    import requests
+
+    vid = extract_video_id(video_id_or_url)
+    if not vid:
+        return None
+
+    try:
+        resp = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            title = str((resp.json() or {}).get("title") or "").strip()
+            if title:
+                return title
+    except Exception as e:
+        logger.info(f"oEmbed title lookup failed for {vid}: {e}")
+
+    # Fallback: the watch page <title> (no cookies, no yt-dlp).
+    try:
+        resp = requests.get(
+            f"https://www.youtube.com/watch?v={vid}",
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; HeatCut/1.0)"},
+        )
+        if resp.status_code == 200:
+            from html import unescape
+            m = re.search(r"<title>(.*?)</title>", resp.text, re.S | re.I)
+            if m:
+                title = unescape(m.group(1)).replace("- YouTube", "").strip()
+                if title and title.lower() != "youtube":
+                    return title
+    except Exception as e:
+        logger.info(f"Watch-page title fallback failed for {vid}: {e}")
+
     return None
 
 def get_proxy_url() -> Optional[str]:
@@ -2441,6 +2487,21 @@ def health_check():
 
 
 
+@app.get("/api/video-title")
+def get_video_title_endpoint(video_id: str):
+    """Lightweight title resolution (oEmbed first, watch page as fallback).
+
+    Used by the frontend to backfill placeholder titles in the history list
+    without triggering a full yt-dlp extraction.
+    """
+    title = get_youtube_oembed_title(video_id)
+    return {
+        "video_id": video_id,
+        "title": title or f"YouTube Video ({video_id})",
+        "resolved": bool(title),
+    }
+
+
 def parse_gemini_model_sort_key(name: str):
     """Sort key for Gemini models: parses major and minor versions (e.g. 3.7, 3.6, 3.5, 2.5, 2.0, 1.5),
     tier (standard > lite/8b > preview/exp), so newest and most capable models come first."""
@@ -2592,8 +2653,10 @@ def _provider_llm_call(provider: str, model: str, prompt: str, api_key: str,
             '{"summary": "1-2 sentence summary with 2-4 hashtags", '
             '"clips": [{"title": "catchy max 8 words", "start_time": float, '
             '"end_time": float, "hook_time": float, "virality_score": 1-100, '
-            '"key_quotes": ["quote"], "title_suggestion": "", '
+            '"key_quotes": ["quote"], "title_suggestion": "third-person alternative '
+            'title (no I/me/my/saya)", '
             '"caption_suggestion": "", "hashtag_suggestion": ""}]}'
+            "\nTitles and title_suggestion must be third person: never use 'I', 'me', 'my', 'we' or 'saya' — name the speaker or the topic instead."
         )
     system = system or "You are a precise viral video clip finder. You always return valid JSON matching the requested schema exactly."
     user_content = prompt + json_instruction
@@ -3118,7 +3181,8 @@ async def analyze_video(request: AnalyzeRequest, http_request: Request):
                         "Columns: start|end|hook|rewatch_score(0-1)\n"
                         f"---\n{win_desc}\n---\n"
                         "For EVERY moment return: a catchy short title (max 8 words, emoji ok), a punchy "
-                        "alternative title suggestion, an engaging short caption for TikTok/Reels/Shorts "
+                        "alternative title suggestion in third person (never 'I'/'me'/'my'/'saya' — frame "
+                        "the artist or the moment), an engaging short caption for TikTok/Reels/Shorts "
                         "that mentions the hook timestamp, and 3-5 lowercase hashtags. If the video title "
                         "language is obvious, match it; otherwise use English.\n"
                         'Return ONLY JSON: {"clips": [{"start_time": float, "title": "...", '
@@ -3971,7 +4035,8 @@ class CampaignPrepRequest(BaseModel):
 
 _CAMPAIGN_COPY_INSTRUCTION = (
     "\n\nFor EVERY clip index above return short-form copy:\n"
-    "- title: max 8 words, curious and positive, no clickbait the rules forbid\n"
+    "- title: max 8 words, curious and positive, no clickbait the rules forbid, "
+    "always third person (never 'I'/'me'/'my'/'saya' — name the speaker or the topic)\n"
     "- caption: 1-2 sentences for TikTok/Reels, positive & mindful, mentions the source moment\n"
     "- hashtags: 3-6 lowercase hashtags, space separated\n\n"
     'Return ONLY JSON: {"clips": [{"index": int, "title": "...", "caption": "...", "hashtags": "#a #b"}]}'
