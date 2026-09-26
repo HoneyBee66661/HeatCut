@@ -24,7 +24,7 @@ import html
 import json
 import re
 from html.parser import HTMLParser
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 SPADE_API = "https://api.spadeclipping.com/public/campaigns/"
 DEFAULT_HEADERS = {
@@ -238,11 +238,6 @@ def find_timestamp_ranges(text: str) -> List[dict]:
 def _fmt(sec: float) -> str:
     sec = max(0, int(sec))
     return f"{sec // 60}:{sec % 60:02d}" if sec < 3600 else f"{sec // 3600}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
-
-
-def fmt_time(sec: float) -> str:
-    """Public `M:SS` / `H:MM:SS` formatter (prompt rendering + briefs)."""
-    return _fmt(sec)
 
 
 # ---------------------------------------------------------------- requirements
@@ -560,189 +555,6 @@ def _even_windows(duration: float, target: float, count: int, skip_intro: float 
     return [(skip_intro + i * step, skip_intro + i * step + target) for i in range(n)]
 
 
-def normalize_method(value: str) -> str:
-    """Any accepted spelling of a clip method → its canonical name."""
-    key = str(value or "").strip().lower().replace("_", "-")
-    aliases = {
-        "requirement": "requirement", "requirements": "requirement", "req": "requirement",
-        "brief": "requirement", "brief-text": "requirement", "auto": "requirement", "text": "requirement",
-        "campaign": "campaign", "campaign-timestamps": "campaign", "timestamps": "campaign",
-        "heatmap": "heatmap", "retention": "heatmap", "peaks": "heatmap", "telemetry": "heatmap",
-        "even": "even", "even-spread": "even", "spread": "even", "none": "even",
-    }
-    return aliases.get(key, "requirement")
-
-
-def _known_ranges(spec: dict) -> List[Tuple[float, float]]:
-    out: List[Tuple[float, float]] = []
-    for src in spec.get("sources") or []:
-        for ts in src.get("timestamps") or []:
-            try:
-                out.append((float(ts["start"]), float(ts["end"])))
-            except (KeyError, TypeError, ValueError):
-                continue
-    return out
-
-
-def _link_ids(text: str) -> List[str]:
-    ids: List[str] = []
-    for raw in re.findall(r"https?://\S+", text or ""):
-        vid = extract_video_id(raw.strip(").,;"))
-        if vid:
-            ids.append(vid)
-    return ids
-
-
-# "Cut 1:02:00 - 1:02:40 for the priority moment" has the useful words AFTER the
-# range; "Intro hook 5:00 - 5:30" has them before. Read both, drop the filler.
-_LABEL_FILLER_RE = re.compile(
-    r"^(?:cut|clip|clips|part|the part|post|use|take|make|best clip|best part|"
-    r"timestamp|timestamps|time|section|sections|from|for|in|on|of|at|watch|here)\b[\s:,\-–—]*",
-    re.I,
-)
-
-
-def _clean_fragment(text: Any) -> str:
-    out = re.sub(r"[()\[\]]", " ", str(text or ""))
-    out = re.sub(r"\b(?:please|thanks|ya|plis)\b", " ", out, flags=re.I)
-    out = re.sub(r"\s+", " ", out).strip(" .,-–—:;|")
-    return out.strip()
-
-
-def _readable_label(before: Any, after: Any) -> str:
-    """Prefer whichever side of the range actually names the moment.
-
-    "Cut 1:02:00 - 1:02:40 for the priority moment" carries the useful words
-    AFTER the range; "Post the best part, the chorus at 12:30 - 13:45 works
-    great" carries them BEFORE it, behind a filler verb — so a filler head falls
-    back to its last clause ("the chorus") before giving up on the head.
-    """
-    head = _clean_fragment(before)
-    if head and _LABEL_FILLER_RE.match(head):
-        parts = [p.strip() for p in re.split(r"[,;:]", head) if p.strip()]
-        if len(parts) > 1:
-            head = re.sub(r"\b(?:at|on|in|from|for)\s*$", "", parts[-1]).strip(" ,.-–—:")
-    tail = _clean_fragment(after)
-    tail = _LABEL_FILLER_RE.sub("", tail).strip()
-    if head and not _LABEL_FILLER_RE.match(head):
-        if len(head.split()) > 1 or len(tail.split()) < 2:
-            return head[:60]
-    return (tail or head)[:60]
-
-
-def scrape_requirement_timestamps(spec: dict) -> List[dict]:
-    """Timestamps the brief ASKS FOR in words, not in its source list.
-
-    Campaigns often write the window into the requirement itself — "post the
-    part at 12:30 - 13:45", a rule line, a section header, the description — and
-    never attach it to a video link. Those windows used to be lost: prep only
-    looked at the structured per-source list, then fell back to the retention
-    heatmap. This walks the whole brief (description, rules, notes and the raw
-    details text) and returns every window the brief names, deduped against the
-    per-source list and each other.
-
-    Each hit carries `origin` (description | rule | note | brief), a
-    `video_id_hint` when a source link shares its line, and a `source_hint` when
-    the line names a source by label.
-    """
-    req = spec.get("requirements") or {}
-    known = _known_ranges(spec)
-    labels = [(s.get("label") or "").strip() for s in spec.get("sources") or []]
-    found: List[dict] = []
-
-    def hint_label(text: str) -> str:
-        low = (text or "").lower()
-        for lbl in labels:
-            key = lbl.lower()
-            if len(key) > 6 and key[:32] in low:
-                return lbl
-        return ""
-
-    def add(text: str, origin: str, fallback_id: Optional[str] = None) -> None:
-        if not text:
-            return
-        ids = _link_ids(text)
-        hint_id = ids[-1] if ids else fallback_id
-        hint = hint_label(text)
-        for rng in find_timestamp_ranges(text):
-            start, end = float(rng["start"]), float(rng["end"])
-            if any(abs(start - k[0]) < 0.5 and abs(end - k[1]) < 0.5 for k in known):
-                continue  # already listed under the source itself
-            if any(abs(start - f["start"]) < 0.5 and abs(end - f["end"]) < 0.5 for f in found):
-                continue
-            found.append({
-                "start": start,
-                "end": end,
-                "label": _readable_label(rng.get("label"), rng.get("note")) or f"{_fmt(start)} - {_fmt(end)}",
-                "priority": bool(rng.get("priority")),
-                "note": (rng.get("note") or "")[:80],
-                "origin": origin,
-                "video_id_hint": hint_id or None,
-                "source_hint": hint,
-            })
-
-    add(spec.get("description") or "", "description")
-    for rule in (req.get("rules") or []):
-        if "http" in str(rule).lower():
-            continue
-        add(str(rule), "rule")
-    for note in (spec.get("loose_bullets") or []):
-        add(str(note), "note")
-
-    # The raw details text, line by line: a timestamped line with no link belongs
-    # to whatever video the brief mentioned last (that is how briefs are written).
-    last_id: Optional[str] = None
-    for line in (spec.get("plain_details") or "").splitlines():
-        ids = _link_ids(line)
-        if ids:
-            last_id = ids[-1]
-        if find_timestamp_ranges(line):
-            add(line, "brief", last_id)
-    return found
-
-
-def attribute_windows(spec: dict, selected_ids: List[str], stamps: List[dict]) -> Dict[str, List[dict]]:
-    """Decide which SELECTED source each loose window belongs to.
-
-    Order of evidence: the video link on the same line → the source the line
-    names → the only selected source → the primary selected source (flagged
-    `attributed_by="primary"` so the plan can say so out loud).
-    """
-    by_sel = {s["video_id"]: s for s in spec.get("sources") or [] if s.get("video_id") in selected_ids}
-    default_id: Optional[str] = None
-    if selected_ids:
-        hot = [vid for vid in selected_ids if (by_sel.get(vid) or {}).get("priority")]
-        default_id = (hot or selected_ids)[0]
-
-    out: Dict[str, List[dict]] = {vid: [] for vid in selected_ids}
-    for raw in stamps or []:
-        ts = dict(raw)
-        target: Optional[str] = None
-        how = ""
-        hint_id = ts.get("video_id_hint")
-        if hint_id and hint_id in out:
-            target, how = hint_id, "link"
-        if target is None and ts.get("source_hint"):
-            key = str(ts["source_hint"]).strip().lower()[:32]
-            if len(key) > 6:
-                for vid in selected_ids:
-                    label = ((by_sel.get(vid) or {}).get("label") or "").lower()
-                    if key in label or (len(label) > 6 and label[:32] in key):
-                        target, how = vid, "label"
-                        break
-        if target is None and len(selected_ids) == 1:
-            target, how = selected_ids[0], "only-source"
-        if target is None and default_id:
-            target, how = default_id, "primary"
-        if target is None:
-            continue
-        ts["attributed_to"] = target
-        ts["attributed_by"] = how
-        ts["source_label"] = (by_sel.get(target) or {}).get("label") or target
-        out[target].append(ts)
-    return out
-
-
 def build_plan(
     spec: dict,
     source_urls: List[str],
@@ -752,36 +564,12 @@ def build_plan(
     metadata_fn: Optional[Callable[[str], dict]] = None,
     peaks_fn: Optional[Callable[[list, float, float, int], List[dict]]] = None,
     allow_network: bool = True,
-    method: str = "requirement",
-    params: Optional[dict] = None,
 ) -> dict:
-    """Turn a parsed campaign spec into the raw-material cut list.
-
-    `method` decides WHERE the windows come from — it is NOT hard-wired to the
-    retention heatmap, because most briefs never ship telemetry:
-
-    * ``requirement`` (default) — the campaign's own per-source list, then every
-      window the brief's REQUIREMENT/description/rule text asks for, then the
-      manual windows from the clip-plan prompt.
-    * ``campaign`` — the campaign's own timestamp list only (zero network).
-    * ``heatmap`` — retention peaks; the OPT-IN method and the only one that
-      reads telemetry from YouTube.
-    * ``even`` — evenly spread raw windows, nothing else.
-
-    Even spread stays the last-resort fallback for the first three, so a source
-    never silently ends up with zero windows.
-    """
-    params = dict(params or {})
-    method = normalize_method(params.get("method") or method or "requirement")
+    """Turn a parsed campaign spec into the raw-material cut list."""
     req = spec.get("requirements") or {}
-    min_dur = float(params.get("min_duration") or req.get("min_duration_sec") or 15.0)
-    target = max(float(params.get("target_duration") or target_duration or 30.0), min_dur)
-    max_dur = params.get("max_duration") or req.get("max_duration_sec")
-    pad_before = max(0.0, float(params.get("pad_before") or 0.0))
-    pad_after = max(0.0, float(params.get("pad_after") or 0.0))
-    timestamp_source = str(params.get("timestamp_source") or "both").lower()
-    manual_stamps = [dict(t) for t in (params.get("manual_timestamps") or [])]
-    requirement_ts = scrape_requirement_timestamps(spec)
+    min_dur = float(req.get("min_duration_sec") or 15.0)
+    target = max(float(target_duration or 30.0), min_dur)
+    max_dur = req.get("max_duration_sec")
 
     by_id = {s["video_id"]: s for s in spec.get("sources", [])}
     by_url: Dict[str, dict] = {}
@@ -794,9 +582,6 @@ def build_plan(
     warnings: List[str] = []
     source_meta: List[dict] = []
 
-    # Resolve every requested URL FIRST: the requirement-scraped timestamps have
-    # to be attributed to a source before any window can be built.
-    resolved: List[dict] = []
     for raw_url in source_urls or []:
         src = by_url.get(raw_url) or by_id.get(extract_video_id(raw_url) or "")
         if src is None:
@@ -806,204 +591,113 @@ def build_plan(
                 continue
             src = {"url": normalize_youtube_url(raw_url), "video_id": vid, "label": vid,
                    "section": "", "priority": False, "timestamps": []}
-        resolved.append(src)
 
-    selected_ids = [s["video_id"] for s in resolved]
-    attribution = attribute_windows(spec, selected_ids, requirement_ts)
-    manual_by_source = attribute_windows(spec, selected_ids, manual_stamps)
-    if len(selected_ids) > 1:
-        for vid, hits in attribution.items():
-            for hit in hits:
-                if hit.get("attributed_by") == "primary":
-                    warnings.append(
-                        f"Window {_fmt(hit['start'])} - {_fmt(hit['end'])} from the brief is not tied to a "
-                        f"specific video — applied to “{hit.get('source_label') or vid}”. Add its link next to "
-                        "the timestamp to target another source."
-                    )
-
-    for src in resolved:
         entry = {
             "video_id": src["video_id"], "url": src["url"], "label": src["label"],
             "priority": bool(src.get("priority")), "mode": None, "duration": None,
             "title": None, "clip_count": 0, "note": None, "heatmap_points": 0,
-            "requirement_hits": len(attribution.get(src["video_id"]) or []),
-            "manual_hits": len(manual_by_source.get(src["video_id"]) or []),
         }
-        picked: List[dict] = []
-        meta_cache: Dict[str, dict] = {}
 
-        def add_window(start: float, end: float, label: str, evidence: str, score: float,
-                       priority: bool = False, heat=None, section: Optional[dict] = None,
-                       duration: Optional[float] = None) -> None:
-            s = max(0.0, float(start) - pad_before)
-            e = float(end) + pad_after
-            if duration:
-                e = min(e, float(duration))
-            if max_dur and (e - s) > float(max_dur):
-                e = s + float(max_dur)
-            if e - s <= 0:
-                return
-            item = {
-                "video_id": src["video_id"],
-                "source_url": src["url"],
-                "source_label": src["label"],
-                "section_label": label,
-                "priority": bool(priority) or entry["priority"],
-                "start": round(s, 2),
-                "end": round(e, 2),
-                "duration": round(e - s, 2),
-                "evidence": evidence,
-                "heat": heat,
-                "score": score,
-            }
-            if section:
-                item["section_start"] = section.get("start")
-                item["section_end"] = section.get("end")
-                item["origin"] = section.get("origin")
-                item["attributed_by"] = section.get("attributed_by")
-            items.append(item)
-            picked.append(item)
-
-        def slice_into(stamps: List[dict], evidence: str, base_score: float,
-                       hot_score: float, exact: bool = False) -> int:
-            """Slice every window of one stage into clips for THIS source.
-
-            A window another stage already produced (same range ±0.5s) is
-            skipped: the brief's own list wins over the same range pasted by
-            hand, and a manual list never doubles a requirement window.
-
-            `exact=True` keeps the range as ONE window: the campaign's sections
-            are sliced to the requested length, but a window the user pasted by
-            hand IS the window they asked for.
-            """
-            added = 0
-            for ts in sorted(stamps, key=lambda t: (not t.get("priority"), t["start"])):
-                if len(picked) >= per_source:
+        # --- 1) Campaign-defined timestamps: deterministic, no network, no AI
+        if src.get("timestamps"):
+            entry["mode"] = "campaign-timestamps"
+            picked = 0
+            for ts in sorted(src["timestamps"], key=lambda t: (not t.get("priority"), t["start"])):
+                if picked >= per_source:
                     break
-                if any(
-                    abs(float(ts["start"]) - float(p.get("section_start", p["start"]))) < 0.5
-                    and abs(float(ts["end"]) - float(p.get("section_end", p["end"]))) < 0.5
-                    for p in picked
-                ):
-                    continue
-                pieces = [(float(ts["start"]), float(ts["end"]))] if exact \
-                    else _slice_section(ts["start"], ts["end"], target, min_dur)
-                for s0, e0 in pieces:
-                    if len(picked) >= per_source:
+                for s, e in _slice_section(ts["start"], ts["end"], target, min_dur):
+                    if picked >= per_source:
                         break
-                    before = len(picked)
-                    add_window(s0, e0, ts.get("label") or f"{_fmt(s0)} - {_fmt(e0)}", evidence,
-                               hot_score if ts.get("priority") else base_score,
-                               priority=bool(ts.get("priority")), section=ts)
-                    added += len(picked) - before
-            return added
+                    if max_dur and (e - s) > max_dur:
+                        e = s + max_dur
+                    items.append({
+                        "video_id": src["video_id"],
+                        "source_url": src["url"],
+                        "source_label": src["label"],
+                        "section_label": ts["label"],
+                        "priority": bool(ts.get("priority")) or entry["priority"],
+                        "start": round(s, 2),
+                        "end": round(e, 2),
+                        "duration": round(e - s, 2),
+                        "evidence": "campaign-timestamp",
+                        "heat": None,
+                        "score": 1.0 if ts.get("priority") else 0.8,
+                        "section_start": ts["start"],
+                        "section_end": ts["end"],
+                    })
+                    picked += 1
+            entry["clip_count"] = picked
+            if picked == 0:
+                entry["note"] = "Campaign timestamps were shorter than the minimum clip length."
+            source_meta.append(entry)
+            continue
 
-        def ensure_meta() -> dict:
-            """Duration + telemetry, fetched at most once per source."""
-            if "meta" in meta_cache or not allow_network or metadata_fn is None:
-                return meta_cache.get("meta") or {}
+        # --- 2) No timestamps: try retention peaks, else even spread
+        meta = None
+        if allow_network and metadata_fn is not None:
             try:
-                meta_cache["meta"] = metadata_fn(src["url"]) or {}
+                meta = metadata_fn(src["url"])
             except Exception as exc:  # noqa: BLE001 — best effort by design
                 entry["note"] = f"Metadata fetch failed: {exc}"
-                meta_cache["meta"] = {}
-            meta: dict = meta_cache.get("meta") or {}
-            entry["duration"] = float(meta.get("duration") or 0.0) or None
-            entry["title"] = meta.get("title")
-            entry["heatmap_points"] = len(meta.get("heatmap") or [])
-            return meta
+        duration = float((meta or {}).get("duration") or 0.0)
+        heatmap = (meta or {}).get("heatmap") or []
+        entry["duration"] = duration or None
+        entry["title"] = (meta or {}).get("title")
+        entry["heatmap_points"] = len(heatmap)
 
-        # --- 1) Campaign-defined timestamps: deterministic, no network, no AI.
-        #     These are the brief's own list, so they win for every method except
-        #     "heatmap" (an explicit opt-in to telemetry instead of the brief).
-        if method in ("requirement", "campaign") and src.get("timestamps"):
-            if slice_into(src["timestamps"], "campaign-timestamp", 0.8, 1.0):
-                entry["mode"] = "campaign-timestamps"
-            else:
-                entry["note"] = "Campaign timestamps were shorter than the minimum clip length."
-
-        # --- 2) Windows the brief asks for IN WORDS: the requirement text, the
-        #     description, the rules — the timestamps campaigns write in a
-        #     sentence instead of in the structured source list.
-        if method == "requirement" and timestamp_source in ("requirement", "both"):
-            hits = attribution.get(src["video_id"]) or []
-            if hits and slice_into(hits, "requirement-timestamp", 0.85, 1.0):
-                entry["mode"] = "requirement-timestamps"
-
-        # --- 3) Manual windows pasted into the clip-plan prompt (your own list).
-        #     `exact=True`: the window you typed IS the window, not a section to
-        #     be re-sliced to the target length.
-        if method == "requirement" and timestamp_source in ("manual", "both"):
-            hits = manual_by_source.get(src["video_id"]) or []
-            if hits and slice_into(hits, "manual-timestamp", 0.95, 1.0, exact=True):
-                entry["mode"] = "manual-timestamps"
-
-        # --- 4) Retention peaks — OPT-IN only (the one stage that reads YouTube).
-        if method == "heatmap" and not picked:
-            meta = ensure_meta()
-            duration = float(meta.get("duration") or 0.0)
-            heatmap = meta.get("heatmap") or []
-            peaks: List[dict] = []
-            if heatmap and peaks_fn is not None and duration > 0:
-                try:
-                    peaks = peaks_fn(heatmap, duration, target, per_source)
-                except Exception as exc:  # noqa: BLE001
-                    entry["note"] = f"Peak mining failed: {exc}"
-                    peaks = []
-            if peaks:
-                entry["mode"] = "retention-peaks"
-                for w in peaks[:per_source]:
-                    s, e = float(w["start"]), float(w["end"])
-                    add_window(
-                        s, e, f"retention peak @ {_fmt(w.get('hook', s))}", "retention-peak",
-                        round(float(w.get("score") or 0.0), 3),
-                        heat=round(float(w.get("heat") or 0.0), 3), duration=duration,
-                    )
-            elif not entry["note"]:
-                entry["note"] = ("No retention telemetry on this source — nothing to mine. "
-                                 "Keep the brief's timestamps or paste your own.")
-
-        # --- 5) Even spread: the last-resort fallback for EVERY method, and the
-        #     only remaining stage that still needs the video duration.
-        if not picked:
-            meta = ensure_meta()
-            duration = float(meta.get("duration") or 0.0)
-            if duration > 0:
-                entry["mode"] = "even-spread"
-                if not entry["note"]:
-                    entry["note"] = ("The brief has no timestamps for this source — windows spread evenly. "
-                                     "Switch the clip method to “Retention heatmap” to mine viewer re-watch peaks.")
-                for s0, e0 in _even_windows(duration, target, per_source):
-                    if len(picked) >= per_source:
-                        break
-                    add_window(s0, e0, "even spread", "no-telemetry", 0.4, duration=duration)
-            elif not entry["mode"]:
-                if metadata_fn is None or not allow_network:
-                    entry["mode"] = "needs-metadata"
-                    entry["note"] = ("This source has no timestamps in the brief — its window plan needs the "
-                                     "video duration, which the preview does not fetch.")
-                else:
-                    entry["mode"] = "unavailable"
-                    entry["note"] = entry["note"] or "Could not read this source (blocked or unavailable)."
-                    warnings.append(f"“{src['label']}” could not be analyzed: {entry['note']}")
-        entry["clip_count"] = len(picked)
+        windows: List[dict] = []
+        if heatmap and peaks_fn is not None and duration > 0:
+            try:
+                windows = peaks_fn(heatmap, duration, target, per_source)
+            except Exception as exc:  # noqa: BLE001
+                entry["note"] = f"Peak mining failed: {exc}"
+        if windows:
+            entry["mode"] = "retention-peaks"
+            for w in windows[:per_source]:
+                s, e = float(w["start"]), float(w["end"])
+                items.append({
+                    "video_id": src["video_id"],
+                    "source_url": src["url"],
+                    "source_label": src["label"],
+                    "section_label": f"retention peak @ {_fmt(w.get('hook', s))}",
+                    "priority": entry["priority"],
+                    "start": round(s, 2),
+                    "end": round(e, 2),
+                    "duration": round(e - s, 2),
+                    "evidence": "retention-peak",
+                    "heat": round(float(w.get("heat") or 0.0), 3),
+                    "score": round(float(w.get("score") or 0.0), 3),
+                })
+        elif duration > 0:
+            entry["mode"] = "even-spread"
+            entry["note"] = entry["note"] or "No retention telemetry — windows spread evenly across the source."
+            for s, e in _even_windows(duration, target, per_source):
+                items.append({
+                    "video_id": src["video_id"],
+                    "source_url": src["url"],
+                    "source_label": src["label"],
+                    "section_label": "even spread",
+                    "priority": entry["priority"],
+                    "start": round(s, 2),
+                    "end": round(e, 2),
+                    "duration": round(e - s, 2),
+                    "evidence": "no-telemetry",
+                    "heat": None,
+                    "score": 0.4,
+                })
+        else:
+            entry["mode"] = "unavailable"
+            entry["note"] = entry["note"] or "Could not read this source (blocked or unavailable)."
+            warnings.append(f"“{src['label']}” could not be analyzed: {entry['note']}")
+        entry["clip_count"] = sum(1 for it in items if it["video_id"] == src["video_id"])
         source_meta.append(entry)
 
-    # Order: priority first, then campaign timestamps in source order, then the
-    # windows the brief asked for in words, then manual ones, then scored peaks.
-    # Keeps the "top priority for this campaign" note actionable.
-    _EVIDENCE_RANK = {
-        "campaign-timestamp": 0,
-        "requirement-timestamp": 1,
-        "manual-timestamp": 1,
-        "retention-peak": 2,
-        "no-telemetry": 3,
-    }
-
+    # Order: priority first, then campaign timestamps in source order, then
+    # scored peaks. Keeps the "top priority for this campaign" note actionable.
     def sort_key(item: dict):
         return (
             0 if item["priority"] else 1,
-            _EVIDENCE_RANK.get(item["evidence"], 2),
+            0 if item["evidence"] == "campaign-timestamp" else 1,
             -(item.get("score") or 0.0),
             item["start"],
         )
@@ -1043,23 +737,6 @@ def build_plan(
         "target_duration": target,
         "min_duration": min_dur,
         "max_total": max_total,
-        "method": method,
-        "params": {
-            "method": method,
-            "target_duration": target,
-            "min_duration": min_dur,
-            "max_duration": max_dur,
-            "per_source": per_source,
-            "max_clips": max_total,
-            "pad_before": pad_before,
-            "pad_after": pad_after,
-            "timestamp_source": timestamp_source,
-            "source_search": params.get("source_search") or "",
-            "source_count": params.get("source_count") or 0,
-            "notes": params.get("notes") or "",
-        },
-        "requirement_timestamps": [dict(t) for hits in attribution.values() for t in hits],
-        "manual_timestamps": [dict(t) for hits in manual_by_source.values() for t in hits],
     }
 
 
@@ -1068,8 +745,7 @@ def _default_title(item: dict) -> str:
     label = item.get("source_label") or "Clip"
     # A section label that is nothing but a time range (or an auto tag) carries
     # no topic — fall back to the source's own name, which at least reads.
-    if not base or re.fullmatch(r"[\d:\s\-–—]+", base) or base.lower() in (
-            "even spread", "campaign timestamp", "manual window"):
+    if not base or re.fullmatch(r"[\d:\s\-–—]+", base) or base.lower() in ("even spread", "campaign timestamp"):
         base = label
     if item["evidence"] == "retention-peak":
         return f"{base} — hot moment"[:90]
@@ -1107,53 +783,16 @@ def _default_hashtags(item: dict, spec: dict) -> List[str]:
 
 
 def _reason(item: dict) -> str:
-    evidence = item.get("evidence")
-    if evidence == "campaign-timestamp":
+    if item["evidence"] == "campaign-timestamp":
         label = item.get("section_label") or "timestamped section"
         flag = " ⭐ priority section" if item.get("priority") else ""
         return f"Campaign-defined section “{label}” ({_fmt(item.get('section_start', item['start']))} - {_fmt(item.get('section_end', item['end']))}){flag}"
-    if evidence == "requirement-timestamp":
-        where = {
-            "rule": "a campaign rule", "description": "the campaign description",
-            "note": "a brief note", "brief": "the brief's requirement text",
-        }.get(item.get("origin") or "", "the brief's requirement text")
-        flag = " ⭐ priority section" if item.get("priority") else ""
-        return (f"The brief asks for “{item.get('section_label')}” "
-                f"({_fmt(item.get('section_start', item['start']))} - {_fmt(item.get('section_end', item['end']))}) "
-                f"in {where}{flag}")
-    if evidence == "manual-timestamp":
-        return (f"Your own window from the clip plan prompt "
-                f"({_fmt(item.get('section_start', item['start']))} - {_fmt(item.get('section_end', item['end']))})")
-    if evidence == "retention-peak":
+    if item["evidence"] == "retention-peak":
         return f"Retention peak inside {item.get('source_label')} (heat {item.get('heat')})"
     return f"No telemetry on {item.get('source_label')} — evenly spaced raw window"
 
 
 # ---------------------------------------------------------------- brief
-
-_METHOD_LABEL = {
-    "requirement": "timestamps from the brief (structured list → windows named in the requirement text → manual)",
-    "campaign": "the campaign's own timestamp list only",
-    "heatmap": "retention heatmap (opt-in)",
-    "even": "evenly spread windows (no analysis)",
-}
-
-
-def plan_preview(spec: dict, source_urls: List[str], method: str = "requirement",
-                 params: Optional[dict] = None, target_duration: float = 30.0,
-                 per_source: int = 6, max_total: int = 15) -> dict:
-    """What the CURRENT settings would cut, WITHOUT touching the network.
-
-    Same staging as `build_plan` (campaign list → requirement text → manual →
-    even spread), so the preview the UI shows can never disagree with the real
-    run. Sources that would need the video duration or the heatmap come back as
-    `needs-metadata` instead of guessing.
-    """
-    return build_plan(
-        spec, source_urls, target_duration, per_source, max_total,
-        None, None, False, method, params,
-    )
-
 
 def build_brief_md(spec: dict, plan: dict, copy_note: str = "") -> str:
     req = spec.get("requirements") or {}
@@ -1189,40 +828,6 @@ def build_brief_md(spec: dict, plan: dict, copy_note: str = "") -> str:
         for r in spec["loose_bullets"][:12]:
             lines.append(f"- {r}")
     lines.append("")
-    _method = plan.get("method")
-    _params = plan.get("params") or {}
-    if _method:
-        lines.append("## Clip plan")
-        lines.append(f"- Method: **{_METHOD_LABEL.get(_method, _method)}**")
-        bits: List[str] = []
-        if _params.get("target_duration"):
-            bits.append(f"clip {_params['target_duration']:.0f}s")
-        if _params.get("min_duration"):
-            bits.append(f"min {_params['min_duration']:.0f}s")
-        if _params.get("max_duration"):
-            bits.append(f"max {_params['max_duration']:.0f}s")
-        if _params.get("per_source"):
-            bits.append(f"{int(_params['per_source'])} window(s)/source")
-        if _params.get("pad_before") or _params.get("pad_after"):
-            bits.append(f"extra pad -{_params.get('pad_before') or 0:.0f}s/+{_params.get('pad_after') or 0:.0f}s")
-        if bits:
-            lines.append(f"- Parameters: {', '.join(bits)}")
-        req_ts = plan.get("requirement_timestamps") or []
-        if req_ts:
-            lines.append(f"- Windows the brief asks for in its own text ({len(req_ts)}):")
-            for t in req_ts:
-                label = f" · {t['label']}" if t.get("label") else ""
-                lines.append(
-                    f"  - {_fmt(t['start'])} - {_fmt(t['end'])}{label} · from the {t.get('origin')} → "
-                    f"{t.get('source_label')} ({t.get('attributed_by')})"
-                )
-        if _params.get("source_search"):
-            lines.append(f"- Source scrape command: `{_params['source_search']}`")
-        if _params.get("notes"):
-            lines.append(f"- Direction: {_params['notes']}")
-        for warn in (plan.get("prompt_warnings") or []):
-            lines.append(f"  - ⚠ {warn}")
-        lines.append("")
     lines.append(f"## Raw cut list ({len(plan.get('items', []))} clips, target {plan.get('target_duration'):.0f}s each)")
     lines.append("")
     lines.append("Every window below is exported RAW (original quality, ±2s headroom) — trim frame-accurate in your editor.")

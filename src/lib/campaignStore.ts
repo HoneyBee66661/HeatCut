@@ -15,7 +15,7 @@
 // refuses (quota exceeded) the OLDEST sessions are dropped and the write is
 // retried once — an old session must never block the current one.
 
-import type { CampaignSource, CampaignSpec, CreativeStrategy, PrepPlan } from '../CampaignPage';
+import type { CampaignSpec, CreativeStrategy, PrepPlan } from '../CampaignPage';
 import type { MaterialPack } from '../components/MaterialFinder';
 import type { WindowTranscript } from './transcript';
 
@@ -43,12 +43,6 @@ export interface PrepSession {
   exported: Record<string, number>;
   /** item id → caption text + SRT. */
   transcripts: Record<string, WindowTranscript>;
-  /** Which clip method produced the windows (heatmap is opt-in, not the default). */
-  clip_method?: string;
-  /** The editable clip-plan prompt block that was used (parameters + windows). */
-  clip_prompt?: string;
-  /** Source videos scraped by the user's own command (source-less briefs). */
-  scraped_sources?: CampaignSource[];
   /** Creative board for this brief (the consultant's output, if built). */
   strategy?: CreativeStrategy | null;
   strategy_md?: string;
