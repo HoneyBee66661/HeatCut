@@ -8,6 +8,10 @@ import type { MaterialPersist } from './components/MaterialFinder';
 import { buildZip, zipEntry, type ZipEntry } from './lib/zipBundle';
 import { fetchWindowTranscript, srtFilename, type WindowTranscript } from './lib/transcript';
 import {
+  resolveClipPrompt, scrapeSources,
+  type ClipPlanPreview, type RequirementTimestamp, type ScrapeCandidate,
+} from './lib/clipPlan';
+import {
   clearSessions, deleteSession, readIndex, readLastUrl, readSession, writeLastUrl, writeSession,
   type PrepSession, type SessionSummary,
 } from './lib/campaignStore';
@@ -58,6 +62,12 @@ export interface CampaignSpec {
   max_posts_per_user?: number | null;
   sources: CampaignSource[];
   requirements: CampaignRequirements;
+  /** Default clip-plan block from the server (the card starts from this). */
+  clip_prompt?: string;
+  /** Clip methods the server accepts. */
+  clip_methods?: string[];
+  /** Windows the brief names in its own TEXT (requirement/description/rules). */
+  requirement_timestamps?: RequirementTimestamp[];
   loose_bullets?: string[];
   warnings?: string[];
 }
@@ -88,13 +98,21 @@ export interface PlanItem {
 export interface PrepPlan {
   items: PlanItem[];
   warnings: string[];
-  sources: { label: string; mode: string | null; clip_count: number; duration: number | null; heatmap_points?: number; note?: string | null }[];
+  sources: { label: string; mode: string | null; clip_count: number; duration: number | null; heatmap_points?: number; requirement_hits?: number; manual_hits?: number; note?: string | null }[];
   target_duration: number;
   min_duration: number;
   copy_note?: string;
   brief_md: string;
   campaign_id?: string;
   campaign_name?: string;
+  /** Which clip method produced the windows (requirement | campaign | heatmap | even). */
+  method?: string;
+  params?: Record<string, number | string | null>;
+  prompt?: string;
+  prompt_warnings?: string[];
+  /** Windows the brief asks for in its own text, with where they landed. */
+  requirement_timestamps?: RequirementTimestamp[];
+  manual_timestamps?: RequirementTimestamp[];
 }
 
 export interface StrategyIdea {
@@ -190,6 +208,19 @@ const fmt = (sec: number): string => {
   return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 };
 
+/** How a source ended up with its windows, at a glance. */
+const MODE_ICON: Record<string, string> = {
+  'campaign-timestamps': '📋',
+  'requirement-timestamps': '📝',
+  'manual-timestamps': '✍️',
+  'retention-peaks': '🔥',
+  'even-spread': '➖',
+  'needs-metadata': '⏳',
+  unavailable: '⛔',
+};
+
+const modeIcon = (mode?: string | null): string => MODE_ICON[mode || ''] || '•';
+
 export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast, onSendToStudio }: CampaignPageProps) {
   const { t, language } = useLanguage();
   const c = t.campaign;
@@ -221,6 +252,22 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
   const [perSource, setPerSource] = useState(4);
   const [maxTotal, setMaxTotal] = useState(15);
   const [aiCopy, setAiCopy] = useState(false);
+  // Clip plan: WHERE the windows come from (heatmap is opt-in now, not the
+  // default) + the editable parameter prompt the planner actually reads.
+  const [clipMethod, setClipMethod] = useState('requirement');
+  const [clipPrompt, setClipPrompt] = useState('');
+  const [showPrompt, setShowPrompt] = useState(false);
+  const [clipPreview, setClipPreview] = useState<ClipPlanPreview | null>(null);
+  const [clipWarnings, setClipWarnings] = useState<string[]>([]);
+  const [clipBusy, setClipBusy] = useState(false);
+  // Sources scraped with the user's own command, for the briefs that ship none.
+  const [scrapedSources, setScrapedSources] = useState<CampaignSource[]>([]);
+  const [showScrape, setShowScrape] = useState(false);
+  const [scrapeCommand, setScrapeCommand] = useState('');
+  const [scrapeSubject, setScrapeSubject] = useState('');
+  const [scrapeBusy, setScrapeBusy] = useState(false);
+  const [scrapeCandidates, setScrapeCandidates] = useState<ScrapeCandidate[]>([]);
+  const [scrapeNote, setScrapeNote] = useState('');
   // Creative consultant (the brief is the data source, especially when the
   // campaign ships no timestamped videos to cut).
   const [strategyPrompt, setStrategyPrompt] = useState('');
@@ -252,9 +299,24 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
 
   const minDuration = spec?.requirements?.min_duration_sec || 15;
 
+  /** The windows the brief names in its own text (from the live preview when it
+   *  has run, otherwise straight from the parsed brief). */
+  const briefRequirementWindows = useMemo(
+    () => (clipPreview?.requirement_timestamps?.length
+      ? clipPreview.requirement_timestamps
+      : (spec?.requirement_timestamps || [])),
+    [clipPreview, spec],
+  );
+
+  /** Brief sources + anything the user scraped themselves (source-less briefs). */
+  const allSources = useMemo(
+    () => [...(spec?.sources || []), ...scrapedSources],
+    [spec, scrapedSources],
+  );
+
   const selectedUrls = useMemo(
-    () => (spec?.sources || []).filter(s => selected[s.video_id]).map(s => s.url),
-    [spec, selected],
+    () => allSources.filter(s => selected[s.video_id]).map(s => s.url),
+    [allSources, selected],
   );
 
   const groupedItems = useMemo(() => {
@@ -294,6 +356,14 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       setMaxTotal(parsed.max_posts_per_user || 15);
       const minDur = parsed.requirements?.min_duration_sec || 15;
       setTargetDuration(minDur > 30 ? 60 : minDur > 15 ? 30 : 15);
+      // A fresh brief starts from the SERVER's clip-plan block (method =
+      // requirement by default — the heatmap is an opt-in, never the default).
+      setScrapedSources([]);
+      setScrapeCandidates([]);
+      setScrapeNote('');
+      setClipMethod('requirement');
+      setClipPrompt(parsed.clip_prompt || '');
+      setShowScrape(!(parsed.sources || []).length);
       writeLastUrl(url.trim());
       // A fresh parse of this campaign starts a FRESH session timestamp; the
       // stored session itself is written by the auto-save effect below.
@@ -336,6 +406,8 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
           per_source: perSource,
           max_clips: maxTotal,
           allow_network: true,
+          method: clipMethod,
+          prompt: clipPrompt.trim() || undefined,
           generate_copy: aiCopy,
           api_key: apiKey.trim() || undefined,
           provider: aiCopy ? provider : undefined,
@@ -448,6 +520,126 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       return next;
     });
 
+  // ------------------------------------------------------- clip plan + sources
+
+  /**
+   * Live preview of the clip plan: the SAME staging the real prep runs, on the
+   * server, with no LLM and no YouTube fetch — so the windows (and the warning
+   * list) on this card are what Generate Raw Material will actually produce.
+   */
+  const refreshClipPreview = useCallback(async (prompt: string, method: string) => {
+    if (!spec) return;
+    setClipBusy(true);
+    try {
+      const preview = await resolveClipPrompt({
+        spec,
+        prompt: prompt.includes('method =') ? prompt : `method = ${method}\n${prompt}`,
+        source_urls: selectedUrls,
+        target_duration: targetDuration,
+        per_source: perSource,
+        max_clips: maxTotal,
+        language,
+      });
+      setClipPreview(preview);
+      setClipWarnings(preview.warnings || []);
+    } catch (err) {
+      setClipPreview(null);
+      setClipWarnings([err instanceof Error ? err.message : String(err)]);
+    } finally {
+      setClipBusy(false);
+    }
+  }, [spec, selectedUrls, targetDuration, perSource, maxTotal, language]);
+
+  // Debounced: typing in the prompt must not fire a request per keystroke.
+  useEffect(() => {
+    if (!spec) return;
+    const id = setTimeout(() => { void refreshClipPreview(clipPrompt, clipMethod); }, 450);
+    return () => clearTimeout(id);
+  }, [spec, clipPrompt, clipMethod, refreshClipPreview]);
+
+  /** Put the block back to the CURRENT settings (and pick the prompt up again). */
+  const resetClipPrompt = async () => {
+    if (!spec) return;
+    await refreshClipPreview('', clipMethod);
+    try {
+      const preview = await resolveClipPrompt({
+        spec,
+        prompt: `method = ${clipMethod}`,
+        source_urls: selectedUrls,
+        target_duration: targetDuration,
+        per_source: perSource,
+        max_clips: maxTotal,
+        language,
+      });
+      setClipPrompt(preview.template);
+      toast(c.clipPromptResetDone, 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const pickClipMethod = (method: string) => {
+    setClipMethod(method);
+    // Keep the visible block honest: the method line is what the server reads.
+    setClipPrompt(prev => (/^\s*method\s*=/m.test(prev)
+      ? prev.replace(/^\s*method\s*=.*$/m, `method = ${method}`)
+      : `method = ${method}\n${prev}`));
+  };
+
+  /** Scrape candidate sources with the user's own command (never a shell). */
+  const runScrape = async () => {
+    if (scrapeBusy || !spec) return;
+    setScrapeBusy(true);
+    setScrapeNote('');
+    try {
+      const result = await scrapeSources({
+        command: scrapeCommand.trim(),
+        subject: scrapeSubject.trim() || spec.public_name || spec.name || '',
+        spec,
+        limit: 5,
+      });
+      setScrapeCandidates(result.candidates || []);
+      setScrapeNote(result.note || c.scrapeFound(result.count, result.query));
+      if (result.candidates?.length) toast(c.scrapeFound(result.candidates.length, result.query), 5000);
+    } catch (err) {
+      setScrapeCandidates([]);
+      setScrapeNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setScrapeBusy(false);
+    }
+  };
+
+  /** A scraped video becomes a normal source: selectable, cuttable, exportable. */
+  const addScrapedSource = (cand: ScrapeCandidate) => {
+    if (allSources.some(s => s.video_id === cand.video_id)) {
+      setSelected(prev => ({ ...prev, [cand.video_id]: true }));
+      toast(c.scrapeAlready, 3000);
+      return;
+    }
+    const src: CampaignSource = {
+      index: allSources.length,
+      url: cand.url,
+      video_id: cand.video_id,
+      label: cand.title || cand.video_id,
+      section: 'scraped',
+      priority: false,
+      timestamps: [],
+    };
+    setScrapedSources(prev => [...prev, src]);
+    setSelected(prev => ({ ...prev, [cand.video_id]: true }));
+    toast(c.scrapeAdded(cand.title || cand.video_id), 4000);
+  };
+
+  const removeScrapedSource = (videoId: string) => {
+    setScrapedSources(prev => prev.filter(s => s.video_id !== videoId));
+    setSelected(prev => {
+      const next = { ...prev };
+      delete next[videoId];
+      return next;
+    });
+  };
+
+
   // ------------------------------------------------------------- sessions
   // The studio rebuilds its history by scanning `cheat_clip_cache_*`; the
   // campaign page stores one session per campaign (see lib/campaignStore) and
@@ -468,6 +660,9 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       per_source: perSource,
       max_clips: maxTotal,
       ai_copy: aiCopy,
+      clip_method: clipMethod,
+      clip_prompt: clipPrompt,
+      scraped_sources: scrapedSources,
       manual, exported, transcripts,
       strategy, strategy_md: strategyMd,
       strategy_prompt: strategyPrompt, strategy_tone: strategyTone,
@@ -481,6 +676,7 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
       material_style: materialState?.style || 'auto',
     };
   }, [spec, plan, selected, url, targetDuration, perSource, maxTotal, aiCopy, manual, exported, transcripts,
+      clipMethod, clipPrompt, scrapedSources,
       strategy, strategyMd, strategyPrompt, strategyTone, strategyAudience, strategyIdeaCount, materialState]);
 
   // Debounced auto-save: a new plan, a finished download or a fresh caption
@@ -512,6 +708,10 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     setPerSource(session.per_source || 4);
     setMaxTotal(session.max_clips || 15);
     setAiCopy(!!session.ai_copy);
+    setClipMethod(session.clip_method || 'requirement');
+    setClipPrompt(session.clip_prompt || session.spec?.clip_prompt || '');
+    setScrapedSources(session.scraped_sources || []);
+    setShowScrape(!((session.spec?.sources || []).length));
     setManual(session.manual || {});
     setExported(session.exported || {});
     setTranscripts(session.transcripts || {});
@@ -650,8 +850,18 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
     copyText(plan.items.map(i => `${fmt(i.start)} - ${fmt(i.end)}`).join('\n'), c.timestampsCopied);
   };
 
+  const planMethodLabel = (method: string): string =>
+    method === 'campaign' ? c.methodCampaign
+      : method === 'heatmap' ? c.methodHeatmap
+        : method === 'even' ? c.methodEven
+          : c.methodRequirement;
+
   const evidenceLabel = (key: string) =>
-    key === 'campaign-timestamp' ? c.evidenceCampaign : key === 'retention-peak' ? c.evidencePeak : c.evidenceSpread;
+    key === 'campaign-timestamp' ? c.evidenceCampaign
+      : key === 'requirement-timestamp' ? c.evidenceRequirement
+        : key === 'manual-timestamp' ? c.evidenceManual
+          : key === 'retention-peak' ? c.evidencePeak
+            : c.evidenceSpread;
 
   // ------------------------------------------------- manual fallback (403 etc.)
 
@@ -1109,8 +1319,8 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
             <p style={{ margin: '0.25rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>{c.sourcesHint}</p>
           </div>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
-            {(spec.sources || []).map(s => (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }} data-testid="source-list">
+            {allSources.map(s => (
               <label
                 key={s.video_id}
                 style={{
@@ -1131,6 +1341,11 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                     <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{s.label}</span>
                     {s.priority && (
                       <span className="score-badge score-high" style={{ fontSize: '0.65rem' }}>⭐ {c.priorityBadge}</span>
+                    )}
+                    {s.section === 'scraped' && (
+                      <span className="score-badge score-meta" style={{ fontSize: '0.65rem' }} data-testid={`scraped-badge-${s.video_id}`}>
+                        🔎 {c.scrapedBadge}
+                      </span>
                     )}
                     <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
                       {s.timestamps.length ? c.sourceTimestamps(s.timestamps.length) : c.untimedSource}
@@ -1157,9 +1372,274 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
                 >
                   {c.openSource} ↗
                 </a>
+                {s.section === 'scraped' && (
+                  <button
+                    type="button"
+                    data-testid={`scraped-remove-${s.video_id}`}
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); removeScrapedSource(s.video_id); }}
+                    title={c.scrapeRemove}
+                    style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '0.8rem' }}
+                  >
+                    ✕
+                  </button>
+                )}
               </label>
             ))}
           </div>
+
+          {/* No video in the brief? Say what to scrape instead of guessing. The
+              command is parsed server-side and never runs as a shell command. */}
+          <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '0.85rem', display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                data-testid="source-scrape-toggle"
+                className="form-input"
+                style={{ width: 'auto', padding: '0.4rem 0.8rem', fontSize: '0.76rem', cursor: 'pointer', background: 'transparent' }}
+                onClick={() => setShowScrape(v => !v)}
+              >
+                🔎 {showScrape ? c.scrapeHide : c.scrapeShow}
+              </button>
+              {!spec.sources.length && (
+                <span style={{ fontSize: '0.76rem', color: '#fbbf24' }} data-testid="source-scrape-empty">
+                  {c.scrapeNoSources}
+                </span>
+              )}
+              {!!scrapedSources.length && (
+                <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                  {c.scrapeCountLabel(scrapedSources.length)}
+                </span>
+              )}
+            </div>
+
+            {showScrape && (
+              <div data-testid="source-scrape-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                <p style={{ margin: 0, fontSize: '0.76rem', color: 'var(--text-muted)' }}>{c.scrapeHint}</p>
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', flex: '1 1 320px', minWidth: 240 }}>
+                    <span style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>{c.scrapeCommandLabel}</span>
+                    <input
+                      className="form-input"
+                      data-testid="source-scrape-command"
+                      placeholder="ytsearch10: artist name live performance"
+                      value={scrapeCommand}
+                      onChange={(e) => setScrapeCommand(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') void runScrape(); }}
+                      style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', flex: '0 1 220px', minWidth: 180 }}>
+                    <span style={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>{c.scrapeSubjectLabel}</span>
+                    <input
+                      className="form-input"
+                      data-testid="source-scrape-subject"
+                      placeholder={spec.public_name || spec.name || ''}
+                      value={scrapeSubject}
+                      onChange={(e) => setScrapeSubject(e.target.value)}
+                      style={{ fontSize: '0.8rem' }}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className="glowing-btn"
+                    data-testid="source-scrape-run"
+                    disabled={scrapeBusy}
+                    onClick={runScrape}
+                    style={{ height: 40, padding: '0 1.2rem', fontSize: '0.78rem' }}
+                  >
+                    {scrapeBusy ? c.scrapeRunning : `🔎 ${c.scrapeRun}`}
+                  </button>
+                </div>
+                {!!scrapeNote && (
+                  <p data-testid="source-scrape-note" style={{ margin: 0, fontSize: '0.76rem', color: 'var(--text-muted)' }}>{scrapeNote}</p>
+                )}
+                {!!scrapeCandidates.length && (
+                  <div data-testid="source-scrape-results" style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+                    {scrapeCandidates.map(cand => {
+                      const already = allSources.some(s => s.video_id === cand.video_id);
+                      return (
+                        <div
+                          key={cand.video_id}
+                          data-testid={`scrape-candidate-${cand.video_id}`}
+                          style={{
+                            display: 'flex', gap: '0.65rem', alignItems: 'center', padding: '0.5rem 0.65rem',
+                            borderRadius: 10, border: '1px solid rgba(255,255,255,0.07)', background: 'rgba(255,255,255,0.02)',
+                          }}
+                        >
+                          <img src={cand.thumbnail} alt="" width={64} height={36} style={{ borderRadius: 6, objectFit: 'cover' }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: '0.82rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{cand.title}</div>
+                            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                              {cand.channel}{cand.duration_label ? ` · ${cand.duration_label}` : ''}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            data-testid={`scrape-add-${cand.video_id}`}
+                            className="form-input"
+                            disabled={already}
+                            style={{ width: 'auto', padding: '0.35rem 0.7rem', fontSize: '0.74rem', cursor: already ? 'default' : 'pointer', background: 'transparent', opacity: already ? 0.5 : 1 }}
+                            onClick={() => addScrapedSource(cand)}
+                          >
+                            {already ? c.scrapeInList : `➕ ${c.scrapeAdd}`}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* Clip plan — WHERE the windows come from. The retention heatmap used to
+          be the only answer for an untimed source; now the brief's own
+          requirement text is the default and the heatmap is an opt-in. */}
+      {spec && (
+        <section className="glass-panel" data-testid="clip-plan-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: '1.05rem' }}>🎯 {c.clipPlanTitle}</h3>
+            <p style={{ margin: '0.25rem 0 0', fontSize: '0.78rem', color: 'var(--text-muted)' }}>{c.clipPlanHint}</p>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }} data-testid="clip-methods">
+            {([
+              ['requirement', c.methodRequirement, c.methodRequirementDesc],
+              ['campaign', c.methodCampaign, c.methodCampaignDesc],
+              ['heatmap', c.methodHeatmap, c.methodHeatmapDesc],
+            ] as const).map(([key, label, desc]) => (
+              <button
+                key={key}
+                type="button"
+                data-testid={`clip-method-${key}`}
+                onClick={() => pickClipMethod(key)}
+                title={desc}
+                style={{
+                  display: 'flex', flexDirection: 'column', gap: '0.15rem', alignItems: 'flex-start',
+                  padding: '0.55rem 0.85rem', borderRadius: 12, cursor: 'pointer', textAlign: 'left',
+                  background: clipMethod === key ? 'rgba(255, 94, 58, 0.10)' : 'rgba(255,255,255,0.02)',
+                  border: `1px solid ${clipMethod === key ? 'rgba(255, 94, 58, 0.5)' : 'rgba(255,255,255,0.07)'}`,
+                }}
+              >
+                <span style={{ fontSize: '0.8rem', fontWeight: 700, color: clipMethod === key ? 'var(--primary)' : 'var(--text-secondary)' }}>
+                  {label}
+                </span>
+                <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)', maxWidth: 240 }}>{desc}</span>
+              </button>
+            ))}
+          </div>
+
+          {clipMethod === 'heatmap' && (
+            <p data-testid="clip-method-heatmap-note" style={{ margin: 0, fontSize: '0.76rem', color: '#fbbf24' }}>
+              ⚠ {c.methodHeatmapNote}
+            </p>
+          )}
+
+          <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              data-testid="clip-prompt-toggle"
+              className="form-input"
+              style={{ width: 'auto', padding: '0.4rem 0.8rem', fontSize: '0.76rem', cursor: 'pointer', background: 'transparent' }}
+              onClick={() => setShowPrompt(v => !v)}
+            >
+              {showPrompt ? '▾' : '▸'} 🧩 {showPrompt ? c.clipPromptHide : c.clipPromptShow}
+            </button>
+            <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }} data-testid="clip-plan-summary">
+              {clipBusy ? c.clipPlanPreviewing : (clipPreview?.summary?.join(' · ') || c.clipPlanSummaryIdle)}
+            </span>
+            {!!clipPreview && (
+              <span className="score-badge score-meta" style={{ fontSize: '0.68rem' }} data-testid="clip-plan-windows">
+                {c.clipPlanWindowCount(clipPreview.total_windows)}
+              </span>
+            )}
+          </div>
+
+          {showPrompt && (
+            <div data-testid="clip-prompt-panel" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <p style={{ margin: 0, fontSize: '0.76rem', color: 'var(--text-muted)' }}>{c.clipPromptHint}</p>
+              <textarea
+                className="form-input"
+                data-testid="clip-prompt"
+                value={clipPrompt}
+                onChange={(e) => setClipPrompt(e.target.value)}
+                rows={Math.min(18, Math.max(8, clipPrompt.split('\n').length + 1))}
+                spellCheck={false}
+                style={{ fontFamily: 'monospace', fontSize: '0.78rem', lineHeight: 1.5, resize: 'vertical' }}
+              />
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  data-testid="clip-prompt-reset"
+                  className="form-input"
+                  style={{ width: 'auto', padding: '0.4rem 0.8rem', fontSize: '0.76rem', cursor: 'pointer', background: 'transparent' }}
+                  onClick={() => { void resetClipPrompt(); }}
+                >
+                  ♻️ {c.clipPromptReset}
+                </button>
+                <button
+                  type="button"
+                  data-testid="clip-prompt-copy"
+                  className="form-input"
+                  style={{ width: 'auto', padding: '0.4rem 0.8rem', fontSize: '0.76rem', cursor: 'pointer', background: 'transparent' }}
+                  onClick={() => copyText(clipPrompt, c.clipPromptCopied)}
+                >
+                  📋 {c.clipPromptCopy}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* What the prompt actually resolves to: parameters, the windows the
+              brief names in its own text, and every warning the parser raised. */}
+          {!!clipPreview?.params && (
+            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }} data-testid="clip-plan-params">
+              {Object.entries(clipPreview.params)
+                .filter(([, v]) => v !== '' && v !== null && v !== undefined && v !== 0)
+                .map(([k, v]) => (
+                  <span key={k} className="score-badge score-meta" style={{ fontSize: '0.68rem' }}>
+                    {k.replace(/_/g, ' ')}: {String(v).slice(0, 40)}
+                  </span>
+                ))}
+            </div>
+          )}
+
+          {!!briefRequirementWindows.length && (
+            <div data-testid="clip-plan-requirement-windows" style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+              <span style={{ fontSize: '0.74rem', fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>
+                {c.clipPlanBriefWindows(briefRequirementWindows.length)}
+              </span>
+              {briefRequirementWindows.slice(0, 8).map((w, i) => (
+                <span key={i} style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                  ⏱ {fmt(w.start)} - {fmt(w.end)}
+                  {w.label ? ` · ${w.label}` : ''}
+                  {w.source_label ? ` → ${w.source_label}` : ''}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {!!clipPreview && clipPreview.sources.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }} data-testid="clip-plan-sources">
+              {clipPreview.sources.map((s, i) => (
+                <span key={i} style={{ fontSize: '0.76rem', color: 'var(--text-secondary)' }}>
+                  {modeIcon(s.mode)} <strong>{s.label}</strong> — {c.clipPlanSourceLine(s.clip_count, s.mode || '')}
+                  {s.requirement_hits ? ` · ${c.clipPlanRequirementHits(s.requirement_hits)}` : ''}
+                  {s.note ? ` · ${s.note}` : ''}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {!!clipWarnings.length && (
+            <div data-testid="clip-plan-warnings" style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+              {clipWarnings.map((w, i) => (
+                <span key={i} style={{ fontSize: '0.74rem', color: '#fbbf24' }}>⚠ {w}</span>
+              ))}
+            </div>
+          )}
         </section>
       )}
 
@@ -1525,6 +2005,11 @@ export default function CampaignPage({ apiKey, provider, model, baseUrl, onToast
             <span className="score-badge score-meta" style={{ fontSize: '0.72rem' }}>
               {c.resultSummary(plan.items.length, groupedItems.length)}
             </span>
+            {plan.method && (
+              <span className="score-badge score-meta" style={{ fontSize: '0.72rem' }} data-testid="plan-method">
+                🎯 {planMethodLabel(plan.method)}
+              </span>
+            )}
             {plan.copy_note && (
               <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>{c.copyNoteLabel}: {plan.copy_note}</span>
             )}

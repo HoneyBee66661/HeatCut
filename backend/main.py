@@ -4021,6 +4021,11 @@ try:  # ...and for the material finder (what to cut + where to get it)
 except ImportError:  # pragma: no cover
     import material as material_mod  # type: ignore
 
+try:  # ...and the clip-plan prompt (user-editable planner parameters)
+    from backend import clip_prompt as clip_prompt_mod
+except ImportError:  # pragma: no cover
+    import clip_prompt as clip_prompt_mod  # type: ignore
+
 CAMPAIGN_RATE_LIMIT = int(os.environ.get("HEATCUT_CAMPAIGN_RATE_LIMIT", "60"))  # per IP per hour
 CAMPAIGN_RATE_WINDOW = 3600.0
 
@@ -4036,11 +4041,34 @@ class CampaignPrepRequest(BaseModel):
     per_source: int = Field(6, description="Max raw windows per source")
     max_clips: Optional[int] = Field(None, description="Hard cap (defaults to the campaign's max posts per creator)")
     allow_network: bool = Field(True, description="Allow metadata/heatmap fetches for sources without timestamps")
+    method: Optional[str] = Field(None, description="Clip-selection method: requirement (default) | campaign | heatmap | even")
+    prompt: Optional[str] = Field(None, description="Clip-plan prompt: the editable parameter block (overrides the fields above)")
     generate_copy: bool = Field(False, description="Run the optional LLM copy pass (needs api_key)")
     api_key: Optional[str] = None
     provider: Optional[str] = Field(default="gemini", description="'gemini', 'openai', 'anthropic' or 'openai-compatible'")
     model: Optional[str] = None
     base_url: Optional[str] = None
+
+
+class CampaignClipPromptRequest(BaseModel):
+    """Resolve the clip-plan prompt without cutting anything (offline preview)."""
+
+    spec: dict = Field(..., description="Parsed campaign spec from /api/campaign/parse")
+    prompt: Optional[str] = Field(None, description="Clip-plan prompt text (blank = server defaults)")
+    source_urls: Optional[List[str]] = None
+    target_duration: float = Field(30.0)
+    per_source: int = Field(6)
+    max_clips: Optional[int] = None
+    language: Optional[str] = Field("en", description="'en' or 'id' — only labels the summary")
+
+
+class CampaignSourceScrapeRequest(BaseModel):
+    """Scrape source videos when the brief ships none."""
+
+    command: str = Field("", description="Scrape command, e.g. `ytsearch10: artist name live` (never a shell command)")
+    subject: Optional[str] = Field(None, description="Fallback search words when the command is empty")
+    spec: Optional[dict] = Field(None, description="Parsed campaign spec (used for the fallback subject)")
+    limit: Optional[int] = Field(None, description="Results to return (1-8); overrides the ytsearchN prefix")
 
 
 _CAMPAIGN_COPY_INSTRUCTION = (
@@ -4053,7 +4081,7 @@ _CAMPAIGN_COPY_INSTRUCTION = (
 )
 
 
-def _campaign_copy_prompt(spec: dict, chunk: List[dict]) -> str:
+def _campaign_copy_prompt(spec: dict, chunk: List[dict], notes: str = "") -> str:
     req = spec.get("requirements") or {}
     rules = req.get("rules") or []
     head = [
@@ -4067,6 +4095,8 @@ def _campaign_copy_prompt(spec: dict, chunk: List[dict]) -> str:
     if rules:
         head.append("Campaign rules the copy MUST never violate:")
         head.extend(f"- {r[:280]}" for r in rules[:6])
+    if notes.strip():
+        head.append(f"Direction from the creator (follow it, it never overrides the rules above): {notes.strip()[:400]}")
     head.append("")
     head.append("Raw clip windows already cut from that source (index|section|window|length|evidence):")
     head.extend(
@@ -4094,7 +4124,7 @@ def _campaign_copy_call(provider: str, model: str, prompt: str, api_key: str,
 
 
 def _campaign_copy_pass(items: List[dict], spec: dict, provider: str, model: str,
-                        api_key: str, base_url: Optional[str]) -> tuple:
+                        api_key: str, base_url: Optional[str], notes: str = "") -> tuple:
     """Rewrite titles/captions/hashtags per source. Best effort: any failure
     keeps the deterministic copy, so the cut list is never lost to a bad key."""
     by_source: dict = {}
@@ -4105,7 +4135,7 @@ def _campaign_copy_pass(items: List[dict], spec: dict, provider: str, model: str
     for group in by_source.values():
         for i in range(0, len(group), 10):
             chunk = group[i:i + 10]
-            raw = _campaign_copy_call(provider, model, _campaign_copy_prompt(spec, chunk),
+            raw = _campaign_copy_call(provider, model, _campaign_copy_prompt(spec, chunk, notes),
                                       api_key, base_url)
             parsed = _parse_json_response(raw) or {}
             for entry in parsed.get("clips", []) or []:
@@ -4157,14 +4187,43 @@ async def campaign_parse(request: CampaignParseRequest, http_request: Request):
         sum(len(s.get("timestamps") or []) for s in spec.get("sources") or []),
         float((spec.get("requirements") or {}).get("min_duration_sec") or 0),
     )
+
+    # The clip plan the user is about to edit: the default parameter block plus
+    # every window the brief names in its own TEXT (requirement/description/rules)
+    # — shown before any prep runs, and the same scan prep then cuts.
+    try:
+        cap = int(spec.get("max_posts_per_user") or 15)
+    except (TypeError, ValueError):
+        cap = 15
+    min_dur = float((spec.get("requirements") or {}).get("min_duration_sec") or 0)
+    spec["clip_prompt"] = clip_prompt_mod.render_template({
+        "method": "requirement",
+        "target_duration": max(min_dur, 30.0),
+        "per_source": 6,
+        "max_clips": cap,
+    })
+    spec["clip_methods"] = list(clip_prompt_mod.METHODS)
+    try:
+        spec["requirement_timestamps"] = campaign_mod.scrape_requirement_timestamps(spec)
+    except Exception as e:  # noqa: BLE001 — a brief without them still works
+        logger.info(f"Requirement timestamp scan skipped ({str(e)[:120]})")
+        spec["requirement_timestamps"] = []
     return spec
 
 
 @app.post("/api/campaign/prep")
 async def campaign_prep(request: CampaignPrepRequest):
     """Turn the parsed brief into the RAW MATERIAL: a cut list of clip windows
-    (campaign timestamps sliced to length, retention peaks mined when a source
-    has none) plus title/caption/hashtag copy and a markdown brief."""
+    plus title/caption/hashtag copy and a markdown brief.
+
+    Where the windows come from is the CLIP METHOD — `requirement` by default
+    (the brief's own timestamp list, then the windows its requirement text names,
+    then the manual ones from the clip-plan prompt), `campaign` for the brief
+    list only, `heatmap` (opt-in) for viewer re-watch peaks, `even` for plain
+    spacing. The retention heatmap is NOT the default any more: most briefs ship
+    no telemetry at all, and a campaign that names its own moments deserves to be
+    cut exactly there.
+    """
     spec = request.spec or {}
     sources = spec.get("sources") or []
     if not spec.get("campaign_id") and not sources:
@@ -4178,20 +4237,34 @@ async def campaign_prep(request: CampaignPrepRequest):
         cap_default = int(spec.get("max_posts_per_user") or 15)
     except (TypeError, ValueError):
         cap_default = 15
-    max_clips = int(request.max_clips) if request.max_clips else cap_default
-    per_source = max(1, min(int(request.per_source or 6), 30))
+
+    # The clip-plan prompt is authoritative: it is literally what the user sees
+    # and edits, so its values win over the request fields it was rendered from.
+    defaults = {
+        "method": request.method or "requirement",
+        "target_duration": float(request.target_duration or 30.0),
+        "per_source": max(1, min(int(request.per_source or 6), 30)),
+        "max_clips": int(request.max_clips) if request.max_clips else cap_default,
+    }
+    params, prompt_warnings = clip_prompt_mod.resolve(request.prompt or "", defaults)
+    method = campaign_mod.normalize_method(params.get("method") or defaults["method"])
+    max_clips = int(params.get("max_clips") or defaults["max_clips"])
+    per_source = max(1, min(int(params.get("per_source") or defaults["per_source"]), 30))
+    target_duration = float(params.get("target_duration") or defaults["target_duration"])
 
     try:
         plan = await asyncio.to_thread(
             campaign_mod.build_plan,
             spec,
             urls,
-            float(request.target_duration or 30.0),
+            target_duration,
             per_source,
             max_clips,
             fetch_video_metadata,
             _campaign_peaks,
             request.allow_network,
+            method,
+            params,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Campaign prep failed: {e}")
@@ -4212,7 +4285,7 @@ async def campaign_prep(request: CampaignPrepRequest):
             try:
                 applied, copy_model = await asyncio.wait_for(
                     asyncio.to_thread(_campaign_copy_pass, plan["items"], spec, provider, model, key,
-                                      request.base_url), timeout=180)
+                                      request.base_url, params.get("notes") or ""), timeout=180)
                 copy_note = f"AI copy applied to {applied} window(s) with {copy_model}."
                 if applied == 0:
                     copy_note = "AI copy pass returned nothing usable — deterministic titles kept."
@@ -4224,12 +4297,110 @@ async def campaign_prep(request: CampaignPrepRequest):
     plan["campaign_name"] = spec.get("public_name") or spec.get("name")
     plan["copy_note"] = copy_note
     plan["copy_model"] = copy_model
+    plan["prompt"] = request.prompt or ""
+    plan["prompt_template"] = clip_prompt_mod.render_template(params)
+    plan["prompt_warnings"] = prompt_warnings
     plan["brief_md"] = campaign_mod.build_brief_md(spec, plan, copy_note)
     logger.info(
-        "Campaign %s prepped: %d window(s) from %d source(s) (%s)",
-        spec.get("campaign_id"), len(plan.get("items") or []), len(urls), copy_note or "no copy pass",
+        "Campaign %s prepped: %d window(s) from %d source(s) via %s (%s)",
+        spec.get("campaign_id"), len(plan.get("items") or []), len(urls), method,
+        copy_note or "no copy pass",
     )
     return plan
+
+
+@app.post("/api/campaign/clip-prompt")
+async def campaign_clip_prompt(request: CampaignClipPromptRequest, http_request: Request):
+    """Resolve the clip-plan prompt: parameters, warnings and exactly what it cuts.
+
+    Deterministic and OFFLINE (no LLM, no YouTube): the preview runs the same
+    staging as the real prep, so the numbers on screen can never disagree with
+    the run that produces the clips. Sources whose plan still needs the video
+    duration (or the heatmap) come back as `needs-metadata`.
+    """
+    ip = _client_ip(http_request)
+    if _rate_limited(f"campaign-clip-prompt:{ip}", CAMPAIGN_RATE_LIMIT, CAMPAIGN_RATE_WINDOW):
+        raise HTTPException(status_code=429, detail="Terlalu banyak preview clip plan. Coba lagi sebentar lagi.")
+
+    spec = request.spec or {}
+    if not spec.get("campaign_id") and not spec.get("name") and not spec.get("sources"):
+        raise HTTPException(status_code=400, detail="No campaign spec supplied — parse the campaign link first.")
+
+    urls = request.source_urls or [s.get("url") for s in (spec.get("sources") or []) if s.get("url")]
+    try:
+        cap_default = int(spec.get("max_posts_per_user") or 15)
+    except (TypeError, ValueError):
+        cap_default = 15
+
+    defaults = {
+        "method": "requirement",
+        "target_duration": float(request.target_duration or 30.0),
+        "per_source": max(1, min(int(request.per_source or 6), 30)),
+        "max_clips": int(request.max_clips) if request.max_clips else cap_default,
+    }
+    params, warnings = clip_prompt_mod.resolve(request.prompt or "", defaults)
+    method = campaign_mod.normalize_method(params.get("method") or defaults["method"])
+    max_clips = int(params.get("max_clips") or defaults["max_clips"])
+    per_source = max(1, min(int(params.get("per_source") or defaults["per_source"]), 30))
+    target_duration = float(params.get("target_duration") or defaults["target_duration"])
+
+    try:
+        preview = await asyncio.to_thread(
+            campaign_mod.plan_preview, spec, urls, method, params, target_duration, per_source, max_clips,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info(f"Clip-prompt preview failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Clip plan preview failed: {e}")
+
+    language = "id" if str(request.language or "").lower().startswith("id") else "en"
+    return {
+        "method": method,
+        "params": preview.get("params") or params,
+        "warnings": warnings,
+        "plan_warnings": preview.get("warnings") or [],
+        "template": clip_prompt_mod.render_template({**defaults, **params}),
+        "summary": clip_prompt_mod.describe({**defaults, **params}, language),
+        "sources": preview.get("sources") or [],
+        "items": preview.get("items") or [],
+        "total_windows": len(preview.get("items") or []),
+        "requirement_timestamps": preview.get("requirement_timestamps") or [],
+        "manual_timestamps": preview.get("manual_timestamps") or [],
+        "search": (params.get("search") or {}),
+    }
+
+
+@app.post("/api/campaign/sources/scrape")
+async def campaign_sources_scrape(request: CampaignSourceScrapeRequest, http_request: Request):
+    """Turn a scrape COMMAND into real candidate source videos.
+
+    Some briefs ship no video at all — only the product, the rules and the
+    payout. Instead of guessing what to cut, the user says what to scrape
+    (`ytsearch10: <artist> live performance`) and it runs through the app's own
+    yt-dlp search path. Deliberately NOT a shell: shell metacharacters are
+    refused, `yt-dlp` wrappers/flags are stripped, and only a search query plus a
+    result count survive — a paste from a chat window can never run code here.
+    """
+    ip = _client_ip(http_request)
+    if _rate_limited(f"campaign-scrape:{ip}", MATERIAL_SEARCH_LIMIT, CAMPAIGN_RATE_WINDOW):
+        raise HTTPException(status_code=429, detail="Terlalu banyak pencarian sumber. Coba lagi sebentar lagi.")
+
+    spec = request.spec or {}
+    fallback = (request.subject or spec.get("public_name") or spec.get("name") or "").strip()
+    parsed = clip_prompt_mod.search_command(request.command or "", fallback=fallback)
+    if parsed.get("error"):
+        raise HTTPException(status_code=400, detail=parsed["error"])
+    limit = max(1, min(int(request.limit or parsed.get("limit") or 5), 8))
+    found = await _material_live_search([parsed["query"]], limit)
+    candidates = found.get(parsed["query"]) or []
+    logger.info("Campaign source scrape %r -> %d candidate(s)", parsed["query"][:60], len(candidates))
+    return {
+        "command": parsed.get("echo") or "",
+        "query": parsed["query"],
+        "limit": limit,
+        "candidates": candidates,
+        "count": len(candidates),
+        "note": "" if candidates else "No video came back for that command — try different words.",
+    }
 
 
 # ------------------------------------------------- creative strategy (consultant)
