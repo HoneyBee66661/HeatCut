@@ -30,6 +30,14 @@ const cardStyle: React.CSSProperties = {
   padding: PAD,
 };
 const rowStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: '0.6rem', alignItems: 'center' };
+
+/**
+ * The explicit quality entries — always in the picker, whatever the probe
+ * listed: Highest (value "") / 1080p / 480p. The server treats the value as a
+ * height CAP (`height<=N`), so a source without that exact rendition degrades
+ * to the best one at or below it instead of failing.
+ */
+const QUALITY_PRESETS = [1080, 480];
 const chipStyle = (active: boolean): React.CSSProperties => ({
   padding: '0.5rem 0.85rem',
   borderRadius: '10px',
@@ -442,23 +450,40 @@ export default function VideoDownloaderPage({ onToast }: VideoDownloaderPageProp
         </div>
 
         {kind === 'video' && (
-          <div style={rowStyle}>
-            <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{d.qualityLabel}</span>
-            <select
-              className="form-input"
-              data-testid="downloader-quality"
-              style={{ maxWidth: '260px' }}
-              value={quality}
-              onChange={(event) => setQuality(event.target.value)}
-              disabled={busy}
-            >
-              <option value="">{d.qualityBest}</option>
-              {(probe?.qualities || []).map((q) => (
-                <option key={q.height} value={String(q.height)}>
-                  {q.label}{q.filesize ? ` · ${(q.filesize / 1e6).toFixed(1)} MB` : ''}
-                </option>
-              ))}
-            </select>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+            <div style={rowStyle}>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{d.qualityLabel}</span>
+              <select
+                className="form-input"
+                data-testid="downloader-quality"
+                style={{ maxWidth: '260px' }}
+                value={quality}
+                onChange={(event) => setQuality(event.target.value)}
+                disabled={busy}
+              >
+                <option value="">{d.qualityBest}</option>
+                {/* Explicit 1080p / 480p, always present — the probe menu only
+                    lists what the source happens to offer, and the server caps
+                    at the pick (`height<=N`) so a missing rendition degrades
+                    instead of failing. */}
+                {QUALITY_PRESETS.map((height) => {
+                  const known = (probe?.qualities || []).find((q) => q.height === height);
+                  return (
+                    <option key={height} value={String(height)}>
+                      {d.qualityPreset(height)}{known?.filesize ? ` · ${(known.filesize / 1e6).toFixed(1)} MB` : ''}
+                    </option>
+                  );
+                })}
+                {(probe?.qualities || [])
+                  .filter((q) => !QUALITY_PRESETS.includes(q.height))
+                  .map((q) => (
+                    <option key={q.height} value={String(q.height)}>
+                      {q.label}{q.filesize ? ` · ${(q.filesize / 1e6).toFixed(1)} MB` : ''}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>{d.qualityHint}</span>
           </div>
         )}
 
