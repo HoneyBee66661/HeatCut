@@ -739,13 +739,13 @@ def _media_url_ok(fmt: dict, timeout: int = 20) -> bool:
         return False
 
 
-def _miner_pick_pair(formats: List[dict]) -> Tuple[Any, Any]:
-    """The (video, audio) DASH pair the fragment miner will cut (height<=1080)."""
+def _miner_pick_pair(formats: List[dict], max_height: int = 1080) -> Tuple[Any, Any]:
+    """The (video, audio) DASH pair the fragment miner will cut (height<=cap)."""
     vfmt, v_h = None, -1
     for f in formats or []:
         if (f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")
                 and f.get("protocol") == "https" and f.get("ext") == "mp4"
-                and f.get("url") and 0 < (f.get("height") or 0) <= 1080
+                and f.get("url") and 0 < (f.get("height") or 0) <= max_height
                 and (f.get("height") or 0) > v_h):
             vfmt, v_h = f, f.get("height") or 0
     afmt, a_b = None, -1.0
@@ -774,7 +774,8 @@ def _pick_hls_pair(formats: List[dict]) -> Tuple[Any, Any]:
     return vfmt, afmt
 
 
-def _probe_candidates(fmts: List[dict], mode: str, limit: int = 5) -> List[dict]:
+def _probe_candidates(fmts: List[dict], mode: str, limit: int = 5,
+                      max_height: int = 1080) -> List[dict]:
     """Best-first candidate formats for one probe pass.
 
     mode: "video" (video-only), "audio" (audio-only) or "muxed" (BOTH codecs in
@@ -795,7 +796,7 @@ def _probe_candidates(fmts: List[dict], mode: str, limit: int = 5) -> List[dict]
             continue
         if mode == "muxed" and not (v and a):
             continue
-        if mode in ("video", "muxed") and not 0 < (f.get("height") or 0) <= 1080:
+        if mode in ("video", "muxed") and not 0 < (f.get("height") or 0) <= max_height:
             continue
         out.append(f)
     out.sort(key=lambda x: ((x.get("tbr") or x.get("abr") or 0) if mode == "audio"
@@ -803,7 +804,7 @@ def _probe_candidates(fmts: List[dict], mode: str, limit: int = 5) -> List[dict]
     return out[:limit]
 
 
-def _servable_pair(formats: List[dict]) -> Any:
+def _servable_pair(formats: List[dict], max_height: int = 1080) -> Any:
     """Plan for the format/pair whose URLs actually SERVE BYTES (None if none).
 
     {"kind": "dash"|"hls"|"muxed"|"other", "format": "<vid>+<aid>"|"<id>",
@@ -817,18 +818,22 @@ def _servable_pair(formats: List[dict]) -> Any:
     fragment miner can cut; (2) one MUXED format (single URL, download + cut);
     (3) any servable video plus any servable audio (mixed protocols are fine,
     yt-dlp + ffmpeg merge them). "kind" == "dash" is the miner's gate.
+    `max_height` is the user's pick: a 480p request must not be answered with the
+    probed 1080p pair (that is how the quality selector used to be a no-op).
     """
-    vfmt, afmt = _miner_pick_pair(formats)
+    vfmt, afmt = _miner_pick_pair(formats, max_height)
     if vfmt and afmt and _media_url_ok(vfmt) and _media_url_ok(afmt):
         return {"kind": "dash", "format": f"{vfmt.get('format_id')}+{afmt.get('format_id')}",
                 "height": vfmt.get("height")}
-    for f in _probe_candidates(formats, "muxed"):
+    for f in _probe_candidates(formats, "muxed", max_height=max_height):
         if _media_url_ok(f):
             kind = "hls" if "m3u8" in str(f.get("protocol") or "") else "muxed"
             return {"kind": kind, "format": str(f.get("format_id")), "height": f.get("height")}
-    v = next((f for f in _probe_candidates(formats, "video") if _media_url_ok(f)), None)
+    v = next((f for f in _probe_candidates(formats, "video", max_height=max_height)
+              if _media_url_ok(f)), None)
     if v is not None:
-        a = next((f for f in _probe_candidates(formats, "audio") if _media_url_ok(f)), None)
+        a = next((f for f in _probe_candidates(formats, "audio", max_height=max_height)
+                  if _media_url_ok(f)), None)
         if a is not None:
             proto = f"{v.get('protocol') or ''} {a.get('protocol') or ''}"
             return {"kind": "hls" if "m3u8" in proto else "other",
@@ -1704,8 +1709,8 @@ def _hls_clients() -> List[str]:
     return [c.strip() for c in raw.split(",") if c.strip()]
 
 
-def _hls_pick_format(formats: List[dict]):
-    """Best MUXED HLS (m3u8) format <=1080p — HLS here carries video AND audio."""
+def _hls_pick_format(formats: List[dict], max_height: int = 1080):
+    """Best MUXED HLS (m3u8) format within the height cap — HLS carries A+V."""
     best, best_h = None, -1
     for f in formats or []:
         if not f.get("url") or "m3u8" not in str(f.get("protocol") or ""):
@@ -1713,12 +1718,12 @@ def _hls_pick_format(formats: List[dict]):
         if f.get("vcodec") in (None, "none") or f.get("acodec") in (None, "none"):
             continue
         h = f.get("height") or 0
-        if 0 < h <= 1080 and h > best_h:
+        if 0 < h <= max_height and h > best_h:
             best, best_h = f, h
     return best
 
 
-def _hls_servable_format(url: str):
+def _hls_servable_format(url: str, max_height: int = 1080):
     """Extract with an HLS-capable player client; return its best HLS format."""
     import yt_dlp
     err: Any = None
@@ -1740,7 +1745,7 @@ def _hls_servable_format(url: str):
             err = e
             logger.info(f"[export] HLS client={name}: extraction failed ({str(e)[:110]})")
             continue
-        fmt = _hls_pick_format((info or {}).get("formats") or [])
+        fmt = _hls_pick_format((info or {}).get("formats") or [], max_height)
         if fmt:
             return fmt
     raise ValueError(f"no HLS format available ({str(err)[:110]})" if err else "no HLS format available")
@@ -1851,7 +1856,7 @@ def _probe_duration(path: str) -> float:
 
 
 def _auto_partial_export(url: str, tmpdir: str, cut_start: float, cut_end: float,
-                         info: Any = None) -> str:
+                         info: Any = None, max_height: int = 1080) -> str:
     """Cheapest partial path that works: DASH range mining, else HLS segments.
 
     Raises `PartialBlocked` when both are refused, so the API can answer with the
@@ -1862,7 +1867,8 @@ def _auto_partial_export(url: str, tmpdir: str, cut_start: float, cut_end: float
 
     if info is not None:
         try:
-            mined = _frag_miner_export(url, tmpdir, cut_start, cut_end, info=info)
+            mined = _frag_miner_export(url, tmpdir, cut_start, cut_end, info=info,
+                                       max_height=max_height)
             out_dur = _probe_duration(mined)
             if out_dur >= dur * 0.9 and out_dur <= dur + 25.0:
                 return mined
@@ -1875,7 +1881,7 @@ def _auto_partial_export(url: str, tmpdir: str, cut_start: float, cut_end: float
         errors.append("dash-range: no extraction")
 
     try:
-        hls_fmt = _hls_servable_format(url)
+        hls_fmt = _hls_servable_format(url, max_height)
     except Exception as e:  # noqa: BLE001
         errors.append(f"hls-playlist: {str(e)[:110]}")
     else:
@@ -2261,12 +2267,13 @@ def _first_pts(path: str, stream: int) -> float | None:
 
 
 def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float,
-                       info: Any = None) -> str:
+                       info: Any = None, max_height: int = 1080) -> str:
     """Try a partial (fragment-range) export; raise on any failure.
 
     `info` normally comes from `_extract_info_for_export`, which already picked a
     client whose media URLs serve bytes — reusing it keeps the miner's URLs and
-    the full-download fallback's client consistent.
+    the full-download fallback's client consistent. `max_height` is the user's
+    quality pick (the downloader passes its own; the studio keeps the 1080 cap).
     """
     import yt_dlp  # lazy: heavy scraping package
 
@@ -2279,7 +2286,7 @@ def _frag_miner_export(url: str, tmpdir: str, cut_start: float, cut_end: float,
         }) as ydl:
             info = ydl.extract_info(url, download=False)
     formats = (info or {}).get("formats") or []
-    vfmt, afmt = _miner_pick_pair(formats)
+    vfmt, afmt = _miner_pick_pair(formats, max_height)
     if not vfmt or not afmt:
         raise ValueError("no https DASH video+audio pair with sidx")
     if not (vfmt.get("height") or 0) >= 360:
@@ -5067,19 +5074,20 @@ def _dl_cut(src: str, out: str, start: float, end: float, audio_only: bool = Fal
 
 
 def _dl_partial_window(url: str, tmpdir: str, start: float, end: float, info: Any = None,
-                       is_youtube: bool = False) -> str:
+                       is_youtube: bool = False, max_height: int = 1080) -> str:
     """The window cut of a NON-YouTube link: HLS segments, then the DASH miner.
 
     YouTube keeps its own proven ladder (`_auto_partial_export` = DASH ranges
     first). TikTok/Instagram hand back muxed HLS or a progressive mp4, so the
     segment miner is the cheap path there. Raises `PartialBlocked` when neither
     works, so the caller can offer the whole-file route.
+    `max_height` = the requested quality, so a 480p window really is 480p.
     """
     span = end - start
     errors: List[str] = []
     formats = (info or {}).get("formats") or []
 
-    hls_fmt = _hls_pick_format(formats)
+    hls_fmt = _hls_pick_format(formats, max_height)
     if hls_fmt:
         try:
             out = _hls_segment_export(hls_fmt, tmpdir, start, end)
@@ -5093,7 +5101,7 @@ def _dl_partial_window(url: str, tmpdir: str, start: float, end: float, info: An
         errors.append("hls-segments: no muxed HLS rendition")
 
     try:
-        out = _frag_miner_export(url, tmpdir, start, end, info=info)
+        out = _frag_miner_export(url, tmpdir, start, end, info=info, max_height=max_height)
         if _probe_duration(out) >= span * 0.9:
             return out
         raise ValueError("miner output too short")
@@ -5226,6 +5234,12 @@ def _dl_fetch_path(request: "DownloaderFetchRequest") -> tuple:
             raise HTTPException(status_code=400,
                                 detail=f"That window starts past the end of the video ({dur:.0f}s).")
 
+    # The user's explicit quality pick ("480", "1080", "1080p", ""=highest).
+    # `max_height` caps EVERY route (miners included) — without it the picker was
+    # a no-op: the probed plan pins the 1080p pair and the miner capped at 1080.
+    height = dl_mod.parse_quality_height(request.quality)
+    max_height = height or dl_mod.CAP
+
     tmpdir = _new_export_tmp_dir_or_500()
     try:
         # ── cheap partial routes (the miners transfer only the window) ──────
@@ -5234,8 +5248,10 @@ def _dl_fetch_path(request: "DownloaderFetchRequest") -> tuple:
                 path = _dl_audio_window(request.url, tmpdir, start, end, info=info,
                                         audio_ext=audio_ext, is_youtube=is_yt)
                 return path, tmpdir, "audio", audio_ext
-            path = (_auto_partial_export(request.url, tmpdir, start, end, info=info) if is_yt
-                    else _dl_partial_window(request.url, tmpdir, start, end, info=info, is_youtube=False))
+            path = (_auto_partial_export(request.url, tmpdir, start, end, info=info,
+                                         max_height=max_height) if is_yt
+                    else _dl_partial_window(request.url, tmpdir, start, end, info=info,
+                                            is_youtube=False, max_height=max_height))
             return path, tmpdir, "video", "mp4"
 
         # ── whole-media route (mode=full, or the window fallback) ───────────
@@ -5248,14 +5264,25 @@ def _dl_fetch_path(request: "DownloaderFetchRequest") -> tuple:
                 raise ValueError("could not cut the window out of the whole audio")
             return out, tmpdir, "audio", audio_ext
 
-        height = 0
-        try:
-            height = int(str(request.quality or "").strip().rstrip("p") or 0)
-        except ValueError:
-            height = 0
-        fmt = (f"bv*[height<={height}]+ba/b[height<={height}]/b" if is_yt else f"b[height<={height}]/b") \
-            if height else ("bv*[height<=1080]+ba/b[height<=1080]/b" if is_yt else "b")
-        src = _dl_download(request.url, tmpdir, fmt, client=client, plan=plan, is_youtube=is_yt)
+        # A servable plan is PINNED (it is what the probe proved works), but a
+        # pinned 1080p pair must not answer a 480p request → re-derive the plan
+        # capped at the pick, and if no servable pair fits the cap, fall back to
+        # the plain format string for yt-dlp to resolve.
+        pin_plan = True
+        if is_yt and height and (not plan or (plan.get("height") or 0) > height):
+            capped = _servable_pair((info or {}).get("formats") or [], max_height=height)
+            if capped and capped.get("format"):
+                plan = capped
+            else:
+                plan, pin_plan = None, False
+                logger.info(f"[download] no servable pair <= {height}p — letting yt-dlp resolve")
+        if height:
+            fmt = (f"bv*[height<={height}]+ba/b[height<={height}]/b" if is_yt
+                   else f"b[height<={height}]/b")
+        else:
+            fmt = "bv*[height<=1080]+ba/b[height<=1080]/b" if is_yt else "b"
+        src = _dl_download(request.url, tmpdir, fmt, client=client, plan=plan,
+                           is_youtube=is_yt, pin_plan=pin_plan)
         if window_requested:
             out = os.path.join(tmpdir, "dl_window.mp4")
             if not _dl_cut(src, out, start, end):

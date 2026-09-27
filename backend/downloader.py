@@ -207,6 +207,29 @@ def _is_muxed(f: dict) -> bool:
 CAP = 1080
 VIDEO_EXTS = ("mp4", "webm", "mkv", "mov", "m4v", "flv", "3gp")
 
+# The picker always offers these heights EXPLICITLY (plus "highest"), whatever
+# the probe happened to list — a video with only 360p/720p renditions still lets
+# the user ask for 480p/1080p, and yt-dlp's `height<=N` degrades to the best
+# rendition at or below the request instead of failing.
+QUALITY_PRESETS = (1080, 480)
+
+
+def parse_quality_height(quality: Any) -> int:
+    """A requested quality → an int height CAP (0 = no explicit choice).
+
+    Accepts '1080', '1080p', '480', 'best'/'highest'/'' (all → 0). Junk and
+    nonsense heights also read as 0, so a bad value degrades to "highest
+    available" instead of a 400 or an accidental 144p.
+    """
+    raw = str(quality or "").strip().lower().rstrip("p").strip()
+    if not raw or raw in ("best", "highest", "max", "auto", "source"):
+        return 0
+    try:
+        height = int(float(raw))
+    except (TypeError, ValueError):
+        return 0
+    return height if 0 < height <= 4320 else 0
+
 
 def _is_real_video(f: dict) -> bool:
     """A downloadable video rendition — not a storyboard/mhtml thumbnail sheet."""
